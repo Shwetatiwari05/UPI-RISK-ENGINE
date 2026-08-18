@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.env.*
+
+# Local model and generated artifacts
+models/*.pkl
+reports/*.png
+reports/*.json
+data/merged/*.csv
+data/merged/mapped_common_schema.parquet
+data/processed/*.csv
+data/raw/*.csv
+data/processed/*.parquet
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Build / cache
+build/
+dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
