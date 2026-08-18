@@ -1,138 +1,271 @@
-# Hybrid Anomaly Detection for Identifying Ambiguous UPI Transactions
+<div align="center">
 
-Offline, batch-processing research project for post-transaction fraud analysis.
+# 🔐 UPI Fraud Detection System
+### Hybrid Anomaly Detection for Identifying Ambiguous UPI Transactions
 
-The current implementation covers:
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![scikit-learn](https://img.shields.io/badge/scikit--learn-1.5-F7931E?style=for-the-badge&logo=scikit-learn&logoColor=white)](https://scikit-learn.org)
+[![XGBoost](https://img.shields.io/badge/XGBoost-2.1-189AB4?style=for-the-badge)](https://xgboost.readthedocs.io)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-Vite-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://vitejs.dev)
+[![License](https://img.shields.io/badge/License-Academic%20Research-blueviolet?style=for-the-badge)](LICENSE)
 
-- Dataset loading and schema mapping
-- Data preprocessing
-- Feature engineering
-- Supervised fraud detection with XGBoost and Random Forest
-- Unsupervised anomaly detection with Isolation Forest and Local Outlier Factor
-- Local Vite React testing dashboard for manually checking model behavior
-- Explainable research fusion score and downloadable transaction report
-- Finance-style transaction report with population distribution and median grey band
-- Clickable browser-persisted prediction logs with transaction detail views
-- Dedicated Finance Research Report page with ranked transaction line graph and tested-input marker
+> **B.Tech Final Year Major Project** — An end-to-end offline machine learning research system that combines supervised fraud detection and unsupervised anomaly detection with a transparent explainable fusion layer, applied to 7.2 million real UPI transaction records.
 
-The project intentionally does not implement real-time streaming, banking integration,
-authentication, or production deployment. The local API supports only the React testing UI.
+</div>
 
-## Datasets
+---
 
-Use only the following datasets and place downloaded files under `data/raw/`:
+## 📌 Project Highlights
 
-1. PaySim Dataset from Kaggle
-2. UPI Transaction 2024 from Kaggle
-3. IEEE Fraud Detection from Kaggle
-4. Digital Payment Transactions from Zenodo
+| Metric | Value |
+|---|---|
+| 📊 **Total Records Processed** | 7,218,220 transactions |
+| 🎯 **Random Forest ROC-AUC** | **0.978** |
+| 🎯 **XGBoost ROC-AUC** | 0.956 |
+| 🔍 **Fraud Recall (RF)** | 93.1% |
+| 🔍 **Fraud Recall (XGB)** | 90.0% |
+| 📁 **Datasets Used** | 4 public datasets (Kaggle + Zenodo) |
+| 🧠 **Models Trained** | XGBoost, Random Forest, Isolation Forest, LOF |
+| 🖥️ **Frontend** | React + Vite dashboard with 5 pages |
 
-No synthetic datasets are required or generated.
+---
 
-## Folder Structure
+## 🧠 What This Project Does
 
-```text
-upi-fraud-detection/
-|-- data/
-|   |-- raw/
-|   |-- processed/
-|   `-- merged/
-|-- notebooks/
-|-- src/
-|-- models/
-|-- app/
-|   `-- components/
-|-- reports/
-|-- requirements.txt
-|-- README.md
-`-- main.py
+This system performs **post-transaction fraud analysis** on UPI (Unified Payments Interface) transactions using a **hybrid dual-signal approach**:
+
+```
+Raw Transactions (7.2M rows)
+        │
+        ▼
+┌───────────────────────┐      ┌─────────────────────────┐
+│  SUPERVISED LEARNING  │      │  UNSUPERVISED LEARNING  │
+│  XGBoost + RF         │      │  Isolation Forest + LOF │
+│  Fraud Probability    │      │  Anomaly Percentile     │
+└──────────┬────────────┘      └────────────┬────────────┘
+           │                                │
+           └──────────┬─────────────────────┘
+                      ▼
+         ┌────────────────────────┐
+         │   FUSION LAYER         │
+         │  Weighted Score +      │
+         │  Disagreement Band +   │
+         │  Uncertainty Penalty   │
+         └────────────┬───────────┘
+                      ▼
+         ┌────────────────────────┐
+         │   RESEARCH RESOLUTION  │
+         │  LIKELY_LEGITIMATE     │
+         │  AMBIGUOUS_REVIEW   ◀─── Novel contribution
+         │  FRAUD_LIKELY          │
+         └────────────────────────┘
 ```
 
-## Setup
+The `AMBIGUOUS_REVIEW` band is the **core research contribution** — identifying transactions where supervised and unsupervised models disagree, which traditional binary classifiers miss entirely.
 
-### macOS / Linux
+---
+
+## 🏗️ Architecture & Tech Stack
+
+```
+upi-fraud-detection/
+├── src/                        # Core ML pipeline modules
+│   ├── schema_mapping.py       # Multi-dataset schema normalization
+│   ├── data_preprocessing.py   # RobustScaler + OneHot encoding
+│   ├── feature_engineering.py  # 15+ behavioral features
+│   ├── supervised_model.py     # XGBoost + Random Forest training
+│   ├── anomaly_detection.py    # Isolation Forest + LOF training
+│   ├── fusion_model.py         # Dual-signal fusion layer
+│   └── parquet_pipeline.py     # Chunked Parquet ingestion (7.2M rows)
+├── api/
+│   └── main.py                 # FastAPI REST backend (6 endpoints)
+├── app/
+│   └── prediction_engine.py    # Model inference engine
+├── frontend/                   # React + Vite dashboard
+│   └── src/main.jsx            # 5-page interactive UI
+├── models/                     # Trained model artifacts (.pkl)
+├── reports/                    # Auto-generated charts & metrics
+├── data/
+│   ├── raw/                    # Input CSVs (not committed)
+│   ├── merged/                 # Unified Parquet (7.2M rows)
+│   └── processed/              # Feature-engineered Parquet
+└── main.py                     # CLI pipeline entry point
+```
+
+### Technology Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| **ML / Data** | scikit-learn, XGBoost, pandas, PyArrow | Model training & data pipeline |
+| **Storage** | Apache Parquet (Snappy) | Chunked 7.2M-row processing |
+| **Backend API** | FastAPI, Uvicorn, Pydantic | REST inference service |
+| **Frontend** | React 18, Vite, JavaScript | Interactive research dashboard |
+| **Visualization** | Matplotlib, Seaborn, Plotly | Reports & model charts |
+
+---
+
+## 📊 Model Performance
+
+### Supervised Models
+
+| Model | Accuracy | Precision | Recall | F1-Score | ROC-AUC |
+|---|---|---|---|---|---|
+| **Random Forest** | 93.7% | 83.7% | **93.1%** | 88.1% | **0.978** |
+| **XGBoost** | 90.1% | 75.4% | 90.0% | 82.0% | 0.956 |
+
+> Trained on a fraud-preserving sample with 3:1 legitimate-to-fraud ratio + `class_weight="balanced"`. Population fraud rate calibration applied post-training.
+
+### Unsupervised Models
+- **Isolation Forest** — 250 estimators, `contamination=0.05`
+- **Local Outlier Factor** — 35 neighbors, novelty mode
+
+---
+
+## 🗃️ Datasets
+
+Four real-world public datasets, normalized into a unified 10-column schema:
+
+| Dataset | Source | Rows | Domain |
+|---|---|---|---|
+| **PaySim** | Kaggle | ~6.3M | Synthetic mobile money |
+| **UPI Transaction 2024** | Kaggle | ~100K | Indian UPI payments |
+| **IEEE Fraud Detection** | Kaggle | ~590K | E-commerce transactions |
+| **Digital Payment Transactions** | Zenodo | ~230K | Digital payments |
+
+**Common Schema:** `transaction_id · timestamp · amount · sender_id · receiver_id · device_type · merchant_category · location · transaction_type · fraud_label`
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Python 3.10+ | Node.js 18+
+
+### 1. Clone & Setup Python Environment
+
+```bash
+git clone https://github.com/Priyanshu6926/UPI_Fraud_Major_Project.git
+cd UPI_Fraud_Major_Project
+```
+
+**macOS / Linux:**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Windows (PowerShell)
+**Windows (PowerShell):**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Batch Pipeline
+### 2. Add Datasets
 
-```bash
-python main.py --all
+Download the 4 datasets and place them in `data/raw/`:
+```
+data/raw/paysim.csv
+data/raw/upi_transaction_2024.csv
+data/raw/ieee_transaction.csv
+data/raw/digital_payment_transactions.csv
 ```
 
-The pipeline discovers supported dataset files in `data/raw/`, maps them into the
-common schema, preprocesses them, engineers features, trains supervised models, and
-trains anomaly detection models.
-
-For the Parquet layout, chunk-size options, memory behavior, and model-training
-limitations, see [Pipeline.md](Pipeline.md).
-
-## Streamlit Testing Dashboard (Optional)
+### 3. Run the ML Pipeline
 
 ```bash
-streamlit run app/app.py
+# Full pipeline (recommended first run)
+python main.py --all --chunk-size 100000 --fit-rows 100000 --supervised-rows 500000 --legitimate-ratio 3 --anomaly-rows 200000
 ```
 
-This legacy local testing interface displays supervised and unsupervised outputs separately.
+This runs all 5 stages: data mapping → preprocessing → feature engineering → supervised training → anomaly training.
 
-## Vite React Testing Dashboard
+### 4. Start the API + Dashboard
 
-The React dashboard uses a small local FastAPI service because browser JavaScript cannot
-load Python `joblib`, scikit-learn, XGBoost, or Isolation Forest model artifacts directly.
-
-Start the API:
-
+**Terminal 1 — Backend:**
 ```bash
-uvicorn api.main:app --reload
+uvicorn api.main:app --reload --port 8000
 ```
 
-Start the React app in a second terminal:
-
+**Terminal 2 — Frontend:**
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Open:
+Open **http://localhost:5173** in your browser.
 
-```text
-http://localhost:5173
-```
+---
 
-The API is local-only and is used only for manual offline model testing.
-The React dashboard additionally presents an explainable fusion score and a downloadable
-transaction report. Its resolution can be `LIKELY_LEGITIMATE`, `FRAUD_LIKELY`, or
-`AMBIGUOUS_REVIEW`; it is a research interpretation, not a payment decision.
+## 🖥️ Dashboard Features
 
-## Common Schema
+| Page | Description |
+|---|---|
+| **Simulation** | Enter a transaction manually or select a preset and run real-time model inference |
+| **Workflow** | Animated end-to-end pipeline visualization |
+| **Analytics** | Dataset distributions, model metrics, feature importance charts |
+| **Finance Research Report** | Population distribution, median grey band, fusion score explanation |
+| **Prediction Logs** | Persistent history of all tested transactions with detail views |
 
-Every dataset is mapped into:
+---
 
-- `transaction_id`
-- `timestamp`
-- `amount`
-- `sender_id`
-- `receiver_id`
-- `device_type`
-- `merchant_category`
-- `location`
-- `transaction_type`
-- `fraud_label`
+## 🔬 Key Technical Contributions
 
-## Important Boundary
+1. **Multi-dataset schema normalization** — 4 heterogeneous datasets unified into one 10-column schema with alias-based column resolution
+2. **Chunked Parquet pipeline** — 7.2M rows processed without loading everything into RAM (100K rows/chunk)
+3. **Fraud-preserving stratified sampling** — Retains all fraud rows; legitimate rows sampled at configurable ratio across hour/day strata
+4. **Transparent fusion layer** — Not a third classifier. Combines `fraud_probability` (60%) + `anomaly_percentile` (40%) with a disagreement penalty that creates the `AMBIGUOUS_REVIEW` band
+5. **Probability calibration** — Corrects class-weight training bias back to the real population fraud rate using prior correction
+6. **Sensitivity diagnostics** — Each prediction includes 6 controlled input variations (amount×10, night time, CASH_OUT, etc.) to explain model behavior
 
-The fusion layer is deliberately transparent rather than a third opaque classifier. It uses
-a weighted dual-signal score plus model disagreement and supervised uncertainty to identify
-transactions that belong in an ambiguous research-review band. It does not approve, decline,
-block, or prove fraud for a transaction.
+---
+
+## 📁 API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | API health check |
+| `GET` | `/models/status` | Model artifact availability |
+| `GET` | `/presets` | Sample transaction presets |
+| `GET` | `/reports/summary` | Model metrics + plot list |
+| `GET` | `/analytics/data` | Population stats for charts |
+| `POST` | `/predict` | Full fraud + anomaly + fusion prediction |
+
+---
+
+## ⚠️ Research Scope & Disclaimer
+
+This system is an **offline, post-transaction research experiment**. It intentionally does **not** implement:
+- Real-time payment processing or streaming
+- Banking system integration or authentication
+- Production deployment or fraud blocking
+
+The fusion resolution (`LIKELY_LEGITIMATE` / `AMBIGUOUS_REVIEW` / `FRAUD_LIKELY`) is a research score for comparing model signals — **not a payment decision**.
+
+---
+
+## 👥 Contributors
+
+| Name | Role |
+|---|---|
+| **Priyanshu Shingole** | ML Pipeline, API, Documentation |
+| **Rachit Kale** | Frontend Dashboard, UI/UX |
+
+---
+
+## 📄 License
+
+This project is submitted as a B.Tech Final Year Major Project. All datasets used are publicly available under their respective licenses (Kaggle Open Data, Zenodo CC-BY).
+
+---
+
+<div align="center">
+
+**⭐ If you found this project interesting, please consider giving it a star!**
+
+*Built with ❤️ as a B.Tech Final Year Major Project*
+
+</div>
