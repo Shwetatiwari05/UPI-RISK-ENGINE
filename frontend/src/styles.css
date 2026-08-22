@@ -976,6 +976,15 @@ h2 {
   font-weight: 800;
 }
 
+.sensitivity-row em.flag-on {
+  color: var(--red);
+}
+
+.sensitivity-row em.flag-off {
+  color: var(--muted, #7a8794);
+  font-weight: 600;
+}
+
 .sensitivity-row small {
   color: var(--teal);
   font-weight: 800;

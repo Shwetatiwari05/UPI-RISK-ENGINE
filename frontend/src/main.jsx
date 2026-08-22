@@ -243,6 +243,7 @@ function SimulationPage({ form, result, loading, presets, updateField, applyPres
         </div>
 
         <ComparisonChart amount={Number(form.amount)} fraudProbability={fraudProbability} anomalyConfidence={anomalyConfidence} />
+        <PersonalizationSignals supervised={result?.supervised} />
         <EvidencePanel diagnostics={result?.diagnostics} />
         <FusionResolution fusion={result?.fusion} />
         <CompactTransactionReport report={result?.report} />
@@ -478,6 +479,51 @@ function ComparisonChart({ amount, fraudProbability, anomalyConfidence }) {
           <b>{value.toFixed(1)}</b>
         </div>
       ))}
+    </div>
+  );
+}
+
+function PersonalizationSignals({ supervised }) {
+  const personalization = supervised?.personalization;
+  if (!personalization) {
+    return (
+      <div className="evidence-panel">
+        <div className="mini-title">Personalization Signals</div>
+        <p>Run a transaction to see how this sender's live history shaped the behavioral features.</p>
+      </div>
+    );
+  }
+
+  const count = supervised.live_history_count ?? 0;
+  const minutes = personalization.minutes_since_previous_sender_txn;
+  const flags = [
+    ["Amount Spike", personalization.amount_spike],
+    ["New Payee", personalization.new_payee_flag],
+    ["Unusual Location", personalization.unusual_location_flag],
+    ["Rapid (<5 min)", personalization.rapid_transactions],
+    ["Above ₹20L Bound", supervised.exceeds_realistic_amount_bound],
+  ];
+
+  return (
+    <div className="evidence-panel">
+      <div className="mini-title">Personalization Signals</div>
+      <div className="evidence-summary">
+        <span>Live history compared: <strong>{count} prior transaction{count === 1 ? "" : "s"}</strong></span>
+        <span>Sender baseline avg: <strong>₹{Math.round(personalization.avg_transaction_amount ?? 0).toLocaleString("en-IN")}</strong></span>
+      </div>
+      <div className="sensitivity-list">
+        {flags.map(([label, value]) => (
+          <div className="sensitivity-row" key={label}>
+            <span>{label}</span>
+            <em className={value ? "flag-on" : "flag-off"}>{value ? "Yes" : "No"}</em>
+          </div>
+        ))}
+      </div>
+      <small>
+        {minutes == null
+          ? "No previous scored transaction for this sender, so velocity signals are inactive."
+          : `${minutes.toFixed(1)} min since this sender's previous scored transaction.`}
+      </small>
     </div>
   );
 }
