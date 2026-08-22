@@ -28,6 +28,9 @@ data/merged/mapped_common_schema.parquet
 data/processed/*.csv
 data/raw/*.csv
 data/processed/*.parquet
+data/live_history.db
+data/live_history.db-wal
+data/live_history.db-shm
 
 # Frontend
 frontend/node_modules/
