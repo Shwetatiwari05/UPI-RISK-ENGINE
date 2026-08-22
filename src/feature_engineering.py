@@ -25,6 +25,7 @@ def engineer_features(
     df: pd.DataFrame,
     context: dict[str, object] | None = None,
     constants: dict[str, object] | None = None,
+    live_context: dict[str, dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     """Generate causal behavioral, velocity, risk, and temporal features.
 
@@ -39,6 +40,12 @@ def engineer_features(
 
     ``context`` overrides behavioral values with reference history for
     single-row inference (see :func:`build_feature_context`).
+
+    ``live_context`` optionally maps sender ids to summaries of transactions
+    recorded by the live inference path (see ``src/live_history.py``). Values
+    derived from that growing history take precedence over the frozen
+    training-time snapshot; senders without a live summary keep their existing
+    behaviour.
     """
     LOGGER.info("Starting point-in-time feature engineering on %s rows", len(df))
     validate_common_schema(df)
@@ -53,7 +60,7 @@ def engineer_features(
     features = apply_point_in_time_features(features)
 
     if context is not None:
-        features = _apply_feature_context(features, context)
+        features = _apply_feature_context(features, context, live_context=live_context)
         LOGGER.info("Feature engineering complete with %s columns", len(features.columns))
         return features
 
@@ -207,19 +214,33 @@ def build_feature_context(df: pd.DataFrame) -> dict[str, object]:
     }
 
 
-def _apply_feature_context(df: pd.DataFrame, context: dict[str, object]) -> pd.DataFrame:
+def _apply_feature_context(
+    df: pd.DataFrame,
+    context: dict[str, object],
+    live_context: dict[str, dict[str, object]] | None = None,
+) -> pd.DataFrame:
     """Override behavioral columns with reference-history values for serving.
 
     Single-row inference has no intra-batch history, so values mirror the
     training-period aggregates a scoring service would hold: frequency is the
     sender's stored history size, averages come from stored stats, and no
     previous-transaction gap exists.
+
+    ``live_context`` optionally maps sender ids to summaries of transactions
+    recorded by the live inference path (see ``src/live_history.py``). A
+    sender with recorded history is evaluated against that growing history
+    instead of the frozen training-time snapshot, including the gap to and
+    velocity since their previous live transaction. Senders absent from both
+    sources fall back to pooled population statistics so extreme amounts
+    still register as spikes.
     """
     enriched = df.copy()
     sender_stats = context.get("sender_stats", {})
     global_mean = float(context.get("global_amount_mean", 0.0))
+    global_std = float(context.get("global_amount_std", 0.0))
     hourly_p95 = float(context.get("global_hourly_frequency_p95", 2.0))
     known_pairs = context.get("known_sender_receiver_pairs", set())
+    live_summaries = live_context or {}
 
     averages = []
     frequencies = []
@@ -229,25 +250,69 @@ def _apply_feature_context(df: pd.DataFrame, context: dict[str, object]) -> pd.D
     amount_spikes = []
     unusual_locations = []
     new_payees = []
+    rapid_flags = []
+    minutes_since_previous = []
+
     for row in enriched.itertuples(index=False):
         sender = str(row.sender_id)
         receiver = str(row.receiver_id)
-        stats = sender_stats.get(sender, {})
-        average = float(stats.get("average_amount", global_mean))
-        std = float(stats.get("amount_std", 0.0))
-        frequency = int(stats.get("transaction_frequency", 0))
-        hour_counts = stats.get("hours", {})
+        stats: dict[str, object] = {}
+        summary = live_summaries.get(sender)
+
+        if summary is not None and int(summary.get("count", 0)) > 0:
+            history_count = int(summary["count"])
+            average = float(summary.get("amount_mean", global_mean))
+            std = float(summary.get("amount_std") or 0.0)
+            usual_location = str(summary.get("usual_location") or "Unknown")
+            live_receivers = set(summary.get("known_receivers") or ())
+            last_timestamp_text = summary.get("last_timestamp")
+        else:
+            stats = sender_stats.get(sender, {})
+            history_count = int(stats.get("transaction_frequency", 0))
+            average = float(stats.get("average_amount", global_mean))
+            std = float(stats.get("amount_std", 0.0))
+            usual_location = str(stats.get("usual_location", "Unknown"))
+            live_receivers = set()
+            last_timestamp_text = None
+
+        hour_counts = stats.get("hours", {}) if not last_timestamp_text else {}
         current_hour_count = int(hour_counts.get(int(row.hour_of_day), 0))
-        usual_location = str(stats.get("usual_location", "Unknown"))
+
+        if last_timestamp_text is not None:
+            if history_count >= 2:
+                spike = int(float(row.amount) > average + (3.0 * std))
+            else:
+                spike = int(average > 0 and float(row.amount) > 2 * average)
+        elif history_count > 1:
+            spike = int(float(row.amount) > average + (3.0 * std))
+        elif global_std > 0:
+            spike = int(
+                float(row.amount) > global_mean + (3.0 * global_std)
+                and float(row.amount) > 10 * global_mean
+            )
+        else:
+            spike = 0
+
+        minutes_since_prev = np.nan
+        if last_timestamp_text:
+            try:
+                previous_timestamp = pd.Timestamp(last_timestamp_text)
+            except (TypeError, ValueError):
+                previous_timestamp = pd.NaT
+            if pd.notna(previous_timestamp):
+                delta_minutes = (row.timestamp - previous_timestamp).total_seconds() / 60.0
+                minutes_since_prev = max(delta_minutes, 0.0)
 
         averages.append(average)
-        frequencies.append(frequency)
-        merchant_diversity.append(int(stats.get("merchant_diversity", 0)))
-        device_switching.append(int(stats.get("device_switching_frequency", 0)))
+        frequencies.append(history_count)
+        merchant_diversity.append(int(stats.get("merchant_diversity", 0)) if not last_timestamp_text else 0)
+        device_switching.append(int(stats.get("device_switching_frequency", 0)) if not last_timestamp_text else 0)
         hourly_counts.append(current_hour_count)
-        amount_spikes.append(int(float(row.amount) > average + (3.0 * std) if frequency > 1 else 0))
+        amount_spikes.append(spike)
         unusual_locations.append(int(str(row.location) != usual_location))
-        new_payees.append(int((sender, receiver) not in known_pairs))
+        new_payees.append(int(receiver not in live_receivers and (sender, receiver) not in known_pairs))
+        rapid_flags.append(int(np.isfinite(minutes_since_prev) and minutes_since_prev <= RAPID_TRANSACTION_WINDOW_MINUTES))
+        minutes_since_previous.append(minutes_since_prev)
 
     enriched["avg_transaction_amount"] = np.asarray(averages, dtype="float32")
     enriched["transaction_frequency"] = np.asarray(frequencies, dtype="int32")
@@ -260,7 +325,8 @@ def _apply_feature_context(df: pd.DataFrame, context: dict[str, object]) -> pd.D
     ).astype("int8")
     enriched["new_payee_flag"] = np.asarray(new_payees, dtype="int8")
     enriched["unusual_location_flag"] = np.asarray(unusual_locations, dtype="int8")
-    enriched["rapid_transactions"] = np.zeros(len(enriched), dtype="int8")
+    enriched["rapid_transactions"] = np.asarray(rapid_flags, dtype="int8")
+    enriched["minutes_since_previous_sender_txn"] = np.asarray(minutes_since_previous, dtype="float64")
     return enriched
 
 

@@ -336,9 +336,10 @@ def predict_fraud_probability(
     preprocessor: UPITransactionPreprocessor,
     df: pd.DataFrame,
     feature_context: dict[str, object] | None = None,
+    live_context: dict[str, dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     """Generate fraud probability and binary prediction for new transactions."""
-    engineered = engineer_features(df, context=feature_context)
+    engineered = engineer_features(df, context=feature_context, live_context=live_context)
     x = preprocessor.transform(engineered)
     probability = model.predict_proba(x)[:, 1]
     output = df[["transaction_id"]].copy()

@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from src.live_history import UPI_ABSOLUTE_MAX_AMOUNT
+
 
 FUSION_WEIGHTS = {
     "supervised_fraud_probability": 0.60,
@@ -172,8 +174,18 @@ def fuse_signals(
     fraud_likely_threshold = resolved_thresholds["fraud_likely_fusion_threshold"]
     supervised_gate = resolved_thresholds["fraud_likely_requires_supervised_probability"]
     review_threshold = resolved_thresholds["ambiguous_review_fusion_threshold"]
+    exceeds_realistic_bound = bool(
+        supervised.get("exceeds_realistic_amount_bound", False)
+    )
 
-    if ambiguity_score >= resolved_thresholds["ambiguous_score_threshold"] or (
+    if exceeds_realistic_bound:
+        resolution = "FRAUD_LIKELY"
+        resolution_text = (
+            "Amount exceeds the realistic UPI ceiling of "
+            f"{UPI_ABSOLUTE_MAX_AMOUNT:,.0f}; deterministic data-validation "
+            "bound breached"
+        )
+    elif ambiguity_score >= resolved_thresholds["ambiguous_score_threshold"] or (
         disagreement >= resolved_thresholds["ambiguous_disagreement_threshold"]
     ):
         resolution = "AMBIGUOUS_REVIEW"
@@ -198,6 +210,7 @@ def fuse_signals(
         "ambiguity_score": round(float(ambiguity_score), 6),
         "resolution": resolution,
         "resolution_text": resolution_text,
+        "exceeds_realistic_amount_bound": exceeds_realistic_bound,
         "signal_disagreement": round(float(disagreement), 6),
         "supervised_uncertainty": round(float(supervised_uncertainty), 6),
         "repeatability_penalty": round(float(repeatability_penalty), 6),
@@ -584,7 +597,15 @@ def build_resolution_reasoning(
     amount = float(transaction.get("amount", 0.0) or 0.0)
     hour = _transaction_hour(transaction.get("timestamp"))
     input_factors = []
+    bound_breached = bool(supervised.get("exceeds_realistic_amount_bound", False))
 
+    if bound_breached:
+        input_factors.append(
+            f"Amount {amount:,.2f} exceeds the realistic UPI ceiling of "
+            f"{UPI_ABSOLUTE_MAX_AMOUNT:,.0f}"
+        )
+    if int(supervised.get("live_history_count", 0) or 0) == 0:
+        input_factors.append("Sender has no previously scored transactions in the live system")
     if amount >= 50_000:
         input_factors.append(f"High-value amount of {amount:,.2f}")
     if hour is not None and 0 <= hour <= 5:
@@ -605,6 +626,15 @@ def build_resolution_reasoning(
             f"{fraud_probability:.1%} fraud probability ({fraud_label}), whereas the anomaly model "
             f"places it at the {anomaly_percentile:.1%} unusualness percentile ({anomaly_label}); "
             f"their disagreement is {disagreement:.1%}."
+        )
+    elif resolution == "FRAUD_LIKELY" and bound_breached:
+        resolution_reason = (
+            f"The transaction is fraud-likely because its amount of {amount:,.2f} breaches the "
+            f"deterministic data-validation ceiling of {UPI_ABSOLUTE_MAX_AMOUNT:,.2f} for realistic "
+            "UPI payments; this bound applies independently of the model scores. The statistical "
+            f"signals are reported separately: a supervised fraud probability of "
+            f"{fraud_probability:.1%} and an anomaly unusualness percentile of "
+            f"{anomaly_percentile:.1%} ({anomaly_label})."
         )
     elif resolution == "FRAUD_LIKELY":
         resolution_reason = (
@@ -636,6 +666,8 @@ def build_resolution_reasoning(
         ),
         "supporting_numbers": {
             "amount": amount,
+            "exceeds_realistic_amount_bound": bound_breached,
+            "live_history_count": int(supervised.get("live_history_count", 0) or 0),
             "fraud_probability": round(fraud_probability, 6),
             "anomaly_score": round(float(anomaly.get("anomaly_score", 0.0)), 6),
             "anomaly_percentile": round(anomaly_percentile, 6),

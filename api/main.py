@@ -208,9 +208,13 @@ def predict(payload: TransactionRequest) -> dict[str, Any]:
     }
 
 
-def run_model_prediction(engine: PredictionEngine, transaction: dict[str, Any]) -> dict[str, Any]:
+def run_model_prediction(
+    engine: PredictionEngine,
+    transaction: dict[str, Any],
+    record_history: bool = True,
+) -> dict[str, Any]:
     """Run both model families and return UI-ready prediction values."""
-    outputs = engine.predict(transaction)
+    outputs = engine.predict(transaction, record_history=record_history)
     if outputs["supervised"].empty:
         raise RuntimeError("The supervised model did not return a prediction.")
     supervised = outputs["supervised"].iloc[0].to_dict()
@@ -227,6 +231,10 @@ def run_model_prediction(engine: PredictionEngine, transaction: dict[str, Any]) 
             "confidence_score": float(supervised["confidence_score"]),
             "model_name": str(supervised.get("model_name", "supervised_model")),
             "signal_status": str(supervised.get("signal_status", "calculated")),
+            "exceeds_realistic_amount_bound": bool(
+                supervised.get("exceeds_realistic_amount_bound", 0)
+            ),
+            "live_history_count": int(supervised.get("live_history_count", 0)),
             **(
                 {
                     "fraud_probability_rank": float(
@@ -253,7 +261,11 @@ def build_prediction_diagnostics(
     base_prediction: dict[str, Any],
 ) -> dict[str, Any]:
     """Score controlled variants so the UI can show that inputs affect outputs."""
-    repeat_prediction = run_model_prediction(engine, {**transaction, "transaction_id": f"{transaction['transaction_id']}_repeat"})
+    repeat_prediction = run_model_prediction(
+        engine,
+        {**transaction, "transaction_id": f"{transaction['transaction_id']}_repeat"},
+        record_history=False,
+    )
     base_fraud = base_prediction["supervised"]["fraud_probability"]
     base_anomaly = base_prediction["anomaly"]["anomaly_confidence"]
     repeat_fraud = repeat_prediction["supervised"]["fraud_probability"]
@@ -271,7 +283,7 @@ def build_prediction_diagnostics(
     sensitivity = []
     for name, variant in variants:
         variant["transaction_id"] = f"{transaction['transaction_id']}_{name.lower().replace(' ', '_').replace('/', '_')}"
-        variant_prediction = run_model_prediction(engine, variant)
+        variant_prediction = run_model_prediction(engine, variant, record_history=False)
         fraud_probability = variant_prediction["supervised"]["fraud_probability"]
         anomaly_percentile = variant_prediction["anomaly"]["anomaly_confidence"]
         sensitivity.append(
