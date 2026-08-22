@@ -26,7 +26,10 @@ from src.parquet_pipeline import (
     stream_preprocess_to_parquet,
     write_mapped_parquet,
 )
-from src.parquet_stats import parquet_label_counts
+from src.parquet_stats import (
+    parquet_label_counts,
+    parquet_period_label_counts,
+)
 from src.probability_calibration import build_calibration_metadata
 from src.supervised_model import train_supervised_models
 from src.utils import (
@@ -54,10 +57,13 @@ def parse_args() -> argparse.Namespace:
         help="Tune fusion FRAUD_LIKELY thresholds on out-of-time data",
     )
     parser.add_argument(
-        "--calibration-rows",
-        type=int,
-        default=400_000,
-        help="Natural-prevalence training-period rows reserved for isotonic calibration",
+        "--calibration-fraud-holdout",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of train-period fraud rows reserved for isotonic "
+            "calibration instead of model training (default: 0.25)"
+        ),
     )
     parser.add_argument(
         "--alert-min-precision",
@@ -216,6 +222,62 @@ def tune_and_save_fusion_thresholds(
     return tuned
 
 
+def _build_calibration_frame(
+    processed_path: Path,
+    config: ParquetPipelineConfig,
+    calibration_fraud: pd.DataFrame | None,
+    supervised_sample: pd.DataFrame,
+    population_fraud_rate: float,
+) -> pd.DataFrame | None:
+    """Compose a natural-prevalence calibration frame disjoint from training.
+
+    Combines the held-out train-period fraud rows with a uniform legitimate
+    pool sized so the frame's prevalence matches the population fraud rate.
+    Legitimate rows overlapping the training sample are excluded at sampling
+    time via transaction ids.
+    """
+    if calibration_fraud is None or len(calibration_fraud) == 0:
+        return None
+    fraud_count = len(calibration_fraud)
+    legit_needed = int(
+        round(fraud_count * (1.0 - population_fraud_rate) / max(population_fraud_rate, 1e-9))
+    )
+    draw_rows = int(legit_needed / 0.97) + 10_000
+    training_ids = (
+        frozenset(supervised_sample["transaction_id"])
+        if "transaction_id" in supervised_sample.columns
+        else frozenset()
+    )
+    legit_draw = sample_parquet_rows(
+        processed_path,
+        max_rows=draw_rows,
+        chunk_size=config.chunk_size,
+        target_column="fraud_label",
+        random_state=43,
+        columns=None,
+        strategy="uniform",
+        period_value="train",
+        exclude_transaction_ids=training_ids or None,
+    )
+    draw_labels = pd.to_numeric(
+        legit_draw["fraud_label"], errors="coerce"
+    ).fillna(0).astype(int)
+    legitimate = legit_draw.loc[draw_labels == 0]
+    if len(legitimate) > legit_needed:
+        legitimate = legitimate.sample(n=legit_needed, random_state=43)
+    frame = pd.concat([calibration_fraud, legitimate], ignore_index=True)
+    frame = frame.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    actual_prevalence = float(
+        pd.to_numeric(frame["fraud_label"], errors="coerce").mean()
+    )
+    print(
+        f"Isotonic calibration frame: {frame.shape} "
+        f"(fraud={fraud_count}, legitimate={len(legitimate)}), "
+        f"prevalence target={population_fraud_rate:.4%}, actual={actual_prevalence:.4%}"
+    )
+    return frame
+
+
 def main() -> int:
     """Run selected offline batch stages."""
     ensure_project_dirs()
@@ -339,6 +401,42 @@ def main() -> int:
     if run_all or args.train_supervised:
         print("Stage 4/6: Training supervised models...")
         processed_path = ensure_processed_parquet()
+        label_counts = parquet_label_counts(processed_path, config.chunk_size)
+        total_label_rows = max(1, sum(label_counts.values()))
+        population_fraud_rate = label_counts[1] / total_label_rows
+        train_label_counts = parquet_period_label_counts(
+            processed_path, config.chunk_size, "train"
+        )
+        holdout_frauds = int(
+            round(train_label_counts.get(1, 0) * args.calibration_fraud_holdout)
+        )
+        if holdout_frauds > 0:
+            # Draw the calibration fraud holdout first so training can exclude
+            # these exact rows; otherwise fraud-preserving training consumes
+            # every train-period fraud and no honest calibration pool exists.
+            calibration_fraud = sample_parquet_rows(
+                processed_path,
+                max_rows=holdout_frauds,
+                chunk_size=config.chunk_size,
+                target_column="fraud_label",
+                random_state=42,
+                columns=None,
+                strategy="fraud_preserving",
+                legitimate_ratio=1e-9,
+                period_value="train",
+                max_fraud_rows=holdout_frauds,
+            )
+            calibration_fraud = calibration_fraud.loc[
+                pd.to_numeric(
+                    calibration_fraud["fraud_label"], errors="coerce"
+                ).fillna(0).astype(int)
+                == 1
+            ].reset_index(drop=True)
+            holdout_ids = frozenset(calibration_fraud["transaction_id"])
+            print(f"Calibration fraud holdout: {len(calibration_fraud)} rows")
+        else:
+            calibration_fraud = None
+            holdout_ids = frozenset()
         supervised_sample = sample_parquet_rows(
             processed_path,
             max_rows=args.supervised_rows,
@@ -349,37 +447,18 @@ def main() -> int:
             strategy="fraud_preserving",
             legitimate_ratio=args.legitimate_ratio,
             period_value="train",
+            exclude_transaction_ids=holdout_ids or None,
         )
         print(
             "Using fraud-preserving supervised sample (training period only): "
             f"{supervised_sample.shape}, legitimate_ratio={args.legitimate_ratio:.2f}"
         )
-        calibration_sample = sample_parquet_rows(
-            processed_path,
-            max_rows=args.calibration_rows,
-            chunk_size=config.chunk_size,
-            target_column="fraud_label",
-            random_state=42,
-            columns=None,
-            strategy="uniform",
-            period_value="train",
-        )
-        overlap_before = len(calibration_sample)
-        if "transaction_id" in supervised_sample.columns:
-            training_ids = set(supervised_sample["transaction_id"])
-            if "transaction_id" in calibration_sample.columns:
-                calibration_sample = calibration_sample.loc[
-                    ~calibration_sample["transaction_id"].isin(training_ids)
-                ].reset_index(drop=True)
-        calibration_prevalence = (
-            float(calibration_sample["fraud_label"].mean())
-            if len(calibration_sample)
-            else 0.0
-        )
-        print(
-            f"Isotonic calibration sample: {calibration_sample.shape} "
-            f"({overlap_before - len(calibration_sample)} rows excluded as "
-            f"training overlaps), fraud prevalence={calibration_prevalence:.4%}"
+        calibration_sample = _build_calibration_frame(
+            processed_path=processed_path,
+            config=config,
+            calibration_fraud=calibration_fraud,
+            supervised_sample=supervised_sample,
+            population_fraud_rate=population_fraud_rate,
         )
         evaluation_frame = load_period_frame(processed_path, "test", config.chunk_size)
         print(f"Out-of-time evaluation frame: {evaluation_frame.shape}")
@@ -394,9 +473,7 @@ def main() -> int:
         )
         del evaluation_frame
         del calibration_sample
-        label_counts = parquet_label_counts(processed_path, config.chunk_size)
-        total_label_rows = max(1, sum(label_counts.values()))
-        population_fraud_rate = label_counts[1] / total_label_rows
+        del supervised_sample
         calibration_metadata = build_calibration_metadata(
             supervised_results,
             population_fraud_rate=population_fraud_rate,
@@ -424,7 +501,6 @@ def main() -> int:
                 )
         results_path = REPORTS_DIR / "supervised_metrics.json"
         results_path.write_text(json.dumps(supervised_results, indent=2, default=str), encoding="utf-8")
-        del supervised_sample
         print("Supervised model training complete.")
 
     if run_all or args.train_anomaly:

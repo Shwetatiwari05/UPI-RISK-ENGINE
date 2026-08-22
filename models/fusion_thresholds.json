@@ -1,0 +1,28 @@
+{
+  "thresholds": {
+    "fraud_likely_fusion_threshold": 0.113317,
+    "fraud_likely_requires_supervised_probability": 0.00704501,
+    "ambiguous_review_fusion_threshold": 0.090654,
+    "ambiguous_score_threshold": 0.38,
+    "ambiguous_disagreement_threshold": 0.45
+  },
+  "achieved": {
+    "fraud_likely": {
+      "precision": 0.40012,
+      "recall": 0.07931,
+      "f1": 0.132381,
+      "alerts_per_10k_rows": 11.74
+    },
+    "review_band": {
+      "rows": 705120,
+      "fraud_rows": 7377,
+      "precision": 0.010462
+    }
+  },
+  "evaluation_rows": 1419809,
+  "fraud_prevalence": 0.00592333,
+  "min_fraud_precision_target": 0.4,
+  "target_precision_met": true,
+  "tuned_at_utc": "2026-08-22T12:15:18.684837+00:00",
+  "supervised_artifact": "xgboost_model.pkl"
+}

@@ -206,6 +206,8 @@ def sample_parquet_rows(
     legitimate_ratio: float = 3.0,
     stratify_columns: list[str] | None = None,
     period_value: str | None = None,
+    max_fraud_rows: int | None = None,
+    exclude_transaction_ids: set[str] | frozenset[str] | None = None,
 ) -> pd.DataFrame:
     """Return a bounded, reproducible Parquet sample using two passes.
 
@@ -221,6 +223,12 @@ def sample_parquet_rows(
     When ``period_value`` is set (e.g. ``"train"``), both passes restrict the
     candidate pool to rows whose ``period`` column matches, so sampling and
     label statistics never see evaluation-period rows.
+
+    ``max_fraud_rows`` caps how many fraud rows ``fraud_preserving`` may take
+    regardless of budget, enabling held-out fraud splits for calibration.
+
+    ``exclude_transaction_ids`` removes those rows from both passes before any
+    counting or selection, guaranteeing disjoint samples from the same period.
     """
     if max_rows <= 0:
         raise ValueError("max_rows must be greater than zero.")
@@ -246,6 +254,8 @@ def sample_parquet_rows(
     for chunk in iter_parquet_chunks(parquet_path, chunk_size, selected_columns):
         if period_value is not None and "period" in chunk.columns:
             chunk = chunk.loc[chunk["period"].astype(str) == period_value]
+        if exclude_transaction_ids and "transaction_id" in chunk.columns:
+            chunk = chunk.loc[~chunk["transaction_id"].isin(exclude_transaction_ids)]
         if chunk.empty:
             continue
         total_rows += len(chunk)
@@ -291,6 +301,8 @@ def sample_parquet_rows(
         fraud_count = label_counts.get(1, 0)
         legitimate_count = label_counts.get(0, 0)
         fraud_target = min(fraud_count, max_rows)
+        if max_fraud_rows is not None:
+            fraud_target = min(fraud_target, max(int(max_fraud_rows), 0))
         legitimate_target = min(
             legitimate_count,
             max(0, max_rows - fraud_target),
@@ -314,6 +326,8 @@ def sample_parquet_rows(
     for chunk_number, chunk in enumerate(iter_parquet_chunks(parquet_path, chunk_size, selected_columns)):
         if period_value is not None and "period" in chunk.columns:
             chunk = chunk.loc[chunk["period"].astype(str) == period_value]
+        if exclude_transaction_ids and "transaction_id" in chunk.columns:
+            chunk = chunk.loc[~chunk["transaction_id"].isin(exclude_transaction_ids)]
         if chunk.empty:
             continue
         if strategy == "uniform":
