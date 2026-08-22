@@ -235,6 +235,27 @@ def run_model_prediction(
                 supervised.get("exceeds_realistic_amount_bound", 0)
             ),
             "live_history_count": int(supervised.get("live_history_count", 0)),
+            "personalization": {
+                "avg_transaction_amount": float(
+                    supervised.get("avg_transaction_amount", 0.0)
+                ),
+                "transaction_frequency": int(
+                    supervised.get("transaction_frequency", 0)
+                ),
+                "amount_spike": bool(supervised.get("amount_spike", 0)),
+                "new_payee_flag": bool(supervised.get("new_payee_flag", 0)),
+                "unusual_location_flag": bool(
+                    supervised.get("unusual_location_flag", 0)
+                ),
+                "rapid_transactions": bool(supervised.get("rapid_transactions", 0)),
+                "minutes_since_previous_sender_txn": (
+                    None
+                    if pd.isna(supervised.get("minutes_since_previous_sender_txn"))
+                    else round(
+                        float(supervised["minutes_since_previous_sender_txn"]), 2
+                    )
+                ),
+            },
             **(
                 {
                     "fraud_probability_rank": float(

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.anomaly_detection import predict_anomaly
+from src.feature_engineering import engineer_features
 from src.live_history import (
     DEFAULT_LIVE_HISTORY_DB_PATH,
     UPI_ABSOLUTE_MAX_AMOUNT,
@@ -134,6 +135,19 @@ class PredictionEngine:
         exceeds_realistic_bound = bool(amount_value > UPI_ABSOLUTE_MAX_AMOUNT)
         supervised["exceeds_realistic_amount_bound"] = int(exceeds_realistic_bound)
         supervised["live_history_count"] = int(live_summary["count"]) if live_summary else 0
+        transparency_frame = engineer_features(
+            frame, context=self.feature_context, live_context=live_context
+        )
+        for column in (
+            "avg_transaction_amount",
+            "transaction_frequency",
+            "amount_spike",
+            "new_payee_flag",
+            "unusual_location_flag",
+            "rapid_transactions",
+            "minutes_since_previous_sender_txn",
+        ):
+            supervised[column] = transparency_frame.at[0, column]
         anomaly = predict_anomaly(
             self.anomaly_model,
             self.anomaly_preprocessor,
