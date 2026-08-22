@@ -39,7 +39,10 @@ def train_anomaly_models(
     )
     LOGGER.info("Anomaly training dataset size: %s rows", len(training_df))
     if preprocessed:
-        feature_frame = training_df.drop(columns=["transaction_id", "fraud_label"], errors="ignore")
+        feature_frame = training_df.drop(
+            columns=["transaction_id", "fraud_label", "period"],
+            errors="ignore",
+        )
         x = feature_frame.to_numpy(dtype=np.float32, copy=False)
         if preprocessor is None:
             raise ValueError("A fitted preprocessor is required for preprocessed training.")

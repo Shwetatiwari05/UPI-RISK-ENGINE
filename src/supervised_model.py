@@ -12,10 +12,12 @@ import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
+    precision_recall_curve,
     recall_score,
     roc_auc_score,
     roc_curve,
@@ -47,12 +49,17 @@ def train_supervised_models(
     legitimate_ratio: float = 3.0,
     preprocessor: UPITransactionPreprocessor | None = None,
     preprocessed: bool = False,
+    evaluation_frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Train XGBoost and Random Forest models once on a bounded batch.
 
     When ``preprocessed=True``, ``df`` must contain ``transaction_id``,
     ``fraud_label``, and already transformed feature columns. This path lets
     the Parquet pipeline reuse one fit-time preprocessor consistently.
+
+    When ``evaluation_frame`` is provided (the processed evaluation-period
+    rows), models train on the full training frame and are scored strictly
+    out-of-time; otherwise an in-sample random split is used.
     """
     training_df = df.copy() if preprocessed else sample_training_data(
         df,
@@ -62,7 +69,10 @@ def train_supervised_models(
     )
     LOGGER.info("Supervised training dataset size: %s rows", len(training_df))
     if preprocessed:
-        feature_frame = training_df.drop(columns=["transaction_id", "fraud_label"], errors="ignore")
+        feature_frame = training_df.drop(
+            columns=["transaction_id", "fraud_label", "period"],
+            errors="ignore",
+        )
         x = feature_frame.to_numpy(dtype=np.float32, copy=False)
         y = pd.to_numeric(training_df["fraud_label"], errors="coerce").fillna(0).astype(int)
         feature_names = list(feature_frame.columns)
@@ -80,13 +90,35 @@ def train_supervised_models(
         raise ValueError("fraud_label is required for supervised training.")
     LOGGER.info("Supervised feature matrix shape: %s", x.shape)
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        x,
-        y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y if y.nunique() > 1 else None,
-    )
+    if evaluation_frame is not None:
+        x_train, y_train = x, y
+        eval_features = evaluation_frame.drop(
+            columns=["transaction_id", "fraud_label", "period"],
+            errors="ignore",
+        )
+        missing = [column for column in feature_names if column not in eval_features.columns]
+        if missing:
+            raise ValueError(f"Evaluation frame is missing engineered columns: {missing}")
+        x_test = eval_features[feature_names].to_numpy(dtype=np.float32, copy=False)
+        y_test = pd.to_numeric(
+            evaluation_frame["fraud_label"], errors="coerce"
+        ).fillna(0).astype(int)
+        LOGGER.info(
+            "Out-of-time evaluation: train=%s rows (fraud=%s), "
+            "test=%s rows (fraud=%s)",
+            len(x_train),
+            int(y_train.sum()),
+            len(x_test),
+            int(y_test.sum()),
+        )
+    else:
+        x_train, x_test, y_train, y_test = train_test_split(
+            x,
+            y,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=y if y.nunique() > 1 else None,
+        )
 
     models = {
         "random_forest": RandomForestClassifier(
@@ -129,6 +161,7 @@ def train_supervised_models(
         save_joblib(model, save_path)
         save_confusion_matrix(y_test, prediction, report_path / f"{name}_confusion_matrix.png")
         save_roc_curve(y_test, probability, report_path / f"{name}_roc_curve.png")
+        save_pr_curve(y_test, probability, report_path / f"{name}_pr_curve.png")
         save_feature_importance(
             model,
             feature_names,
@@ -172,12 +205,16 @@ def evaluate_classifier(
 ) -> dict[str, Any]:
     """Calculate required supervised fraud metrics."""
     roc_auc = roc_auc_score(y_true, y_probability) if y_true.nunique() > 1 else np.nan
+    pr_auc = (
+        average_precision_score(y_true, y_probability) if y_true.nunique() > 1 else np.nan
+    )
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1_score": f1_score(y_true, y_pred, zero_division=0),
         "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
         "classification_report": classification_report(y_true, y_pred, zero_division=0),
     }
 
@@ -222,6 +259,24 @@ def save_roc_curve(y_true: pd.Series, y_probability: np.ndarray, path: Path) -> 
     plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def save_pr_curve(y_true: pd.Series, y_probability: np.ndarray, path: Path) -> None:
+    """Save a precision-recall curve plot."""
+    if y_true.nunique() < 2:
+        return
+    precision, recall, _ = precision_recall_curve(y_true, y_probability)
+    pr_auc = average_precision_score(y_true, y_probability)
+    prevalence = float(np.mean(y_true))
+    plt.figure(figsize=(6, 4))
+    plt.plot(recall, precision, label=f"PR-AUC = {pr_auc:.3f}")
+    plt.axhline(prevalence, linestyle="--", color="gray", label=f"Baseline = {prevalence:.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
     plt.legend()
     plt.tight_layout()
     plt.savefig(path)

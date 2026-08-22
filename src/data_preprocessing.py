@@ -103,6 +103,8 @@ class UPITransactionPreprocessor:
             self.config.target_column,
             "transaction_id",
             "timestamp",
+            "period",
+            "source_dataset",
         ]
         features = working.drop(columns=[col for col in drop_columns if col in working.columns])
 

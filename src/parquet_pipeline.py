@@ -17,7 +17,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.data_preprocessing import UPITransactionPreprocessor
-from src.feature_engineering import build_feature_context, engineer_features
+from src.feature_engineering import (
+    add_temporal_features,
+    apply_fitted_features,
+    apply_point_in_time_features,
+    build_feature_context,
+    fit_feature_constants,
+)
 from src.schema_mapping import (
     COMMON_SCHEMA,
     COLUMN_ALIASES,
@@ -29,6 +35,7 @@ from src.utils import (
     MERGED_DATA_DIR,
     PROCESSED_DATA_DIR,
     get_logger,
+    safe_datetime,
     save_joblib,
 )
 
@@ -36,6 +43,7 @@ from src.utils import (
 LOGGER = get_logger(__name__)
 DEFAULT_CHUNK_SIZE = 100_000
 DEFAULT_FIT_ROWS = 100_000
+DEFAULT_TEST_FRACTION = 0.2
 DEFAULT_PARQUET_COMPRESSION = "snappy"
 MAPPED_PARQUET_PATH = MERGED_DATA_DIR / "mapped_common_schema.parquet"
 PROCESSED_FEATURES_PARQUET_PATH = PROCESSED_DATA_DIR / "processed_features.parquet"
@@ -197,6 +205,7 @@ def sample_parquet_rows(
     strategy: str = "fraud_preserving",
     legitimate_ratio: float = 3.0,
     stratify_columns: list[str] | None = None,
+    period_value: str | None = None,
 ) -> pd.DataFrame:
     """Return a bounded, reproducible Parquet sample using two passes.
 
@@ -208,6 +217,10 @@ def sample_parquet_rows(
     ``transaction_id`` prefix so no single source dominates the sample purely
     through file ordering; sources missing from that column fall back to
     sequential chunk-order selection.
+
+    When ``period_value`` is set (e.g. ``"train"``), both passes restrict the
+    candidate pool to rows whose ``period`` column matches, so sampling and
+    label statistics never see evaluation-period rows.
     """
     if max_rows <= 0:
         raise ValueError("max_rows must be greater than zero.")
@@ -223,6 +236,7 @@ def sample_parquet_rows(
     for column in strata:
         if requested_columns is not None and column not in requested_columns:
             requested_columns.append(column)
+
     selected_columns = requested_columns
 
     label_counts = {0: 0, 1: 0}
@@ -230,6 +244,10 @@ def sample_parquet_rows(
     source_row_counts: dict[str, int] = {}
     total_rows = 0
     for chunk in iter_parquet_chunks(parquet_path, chunk_size, selected_columns):
+        if period_value is not None and "period" in chunk.columns:
+            chunk = chunk.loc[chunk["period"].astype(str) == period_value]
+        if chunk.empty:
+            continue
         total_rows += len(chunk)
         if strategy == "fraud_preserving":
             values = pd.to_numeric(chunk[target_column], errors="coerce").fillna(0).astype(int)
@@ -294,6 +312,10 @@ def sample_parquet_rows(
     selected_rows = 0
     source_remaining_counts = dict(source_row_counts)
     for chunk_number, chunk in enumerate(iter_parquet_chunks(parquet_path, chunk_size, selected_columns)):
+        if period_value is not None and "period" in chunk.columns:
+            chunk = chunk.loc[chunk["period"].astype(str) == period_value]
+        if chunk.empty:
+            continue
         if strategy == "uniform":
             if source_quotas:
                 pieces = []
@@ -380,14 +402,39 @@ def sample_parquet_rows(
 
 
 def _build_strata_keys(df: pd.DataFrame, columns: list[str]) -> pd.Series:
-    """Build deterministic stratum keys from available engineered columns."""
+    """Build deterministic stratum keys from available engineered columns.
+
+    Continuous (e.g. standardized) values are bucketed into deciles so strata
+    stay meaningful for allocation instead of degenerating into one stratum
+    per row. Discrete columns with a small number of distinct values keep
+    their exact values.
+    """
     available = [column for column in columns if column in df.columns]
-    if not available:
+    if not available or df.empty:
         return pd.Series("all", index=df.index, dtype="object")
-    values = df[available].copy()
+    parts: list[pd.Series] = []
     for column in available:
-        values[column] = values[column].astype(str).fillna("Unknown")
-    return values.astype(str).agg("|".join, axis=1)
+        series = df[column]
+        if pd.api.types.is_numeric_dtype(series):
+            unique_count = series.nunique(dropna=True)
+            if unique_count == 0:
+                parts.append(pd.Series("na", index=df.index))
+                continue
+            if unique_count <= 31:
+                parts.append(series.astype(str).fillna("Unknown"))
+                continue
+            binned = pd.qcut(
+                series.rank(method="first", na_option="keep"),
+                q=10,
+                labels=False,
+            )
+            parts.append(binned.astype(str).fillna("na"))
+        else:
+            parts.append(series.astype(str).fillna("Unknown"))
+    keys = parts[0]
+    for part in parts[1:]:
+        keys = keys + "|" + part
+    return keys
 
 
 def _source_prefixes(transaction_ids: pd.Series) -> pd.Series:
@@ -444,78 +491,113 @@ def stream_preprocess_to_parquet(
     preprocessor: UPITransactionPreprocessor | None = None,
     fit_rows: int = DEFAULT_FIT_ROWS,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    test_fraction: float = DEFAULT_TEST_FRACTION,
 ) -> tuple[UPITransactionPreprocessor, dict[str, int | str]]:
-    """Fit once on a bounded sample, then transform every Parquet chunk once."""
+    """Engineer point-in-time features with a per-source temporal split.
+
+    Every source is processed as one timestamp-sorted block so behavioral
+    aggregates stay strictly causal across chunk boundaries. Rows at or before
+    each source's cutoff quantile are labelled ``train``; later rows are
+    ``test``. Constants (usual locations, high-frequency threshold, cold-start
+    fallbacks) and the preprocessing scaler are fitted on training-period rows
+    only, then applied unchanged to the evaluation period.
+    """
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be between 0 and 1.")
     fitted = preprocessor or UPITransactionPreprocessor()
-    fit_sample = sample_parquet_rows(
+
+    LOGGER.info(
+        "Scanning temporal boundaries: test_fraction=%.2f path=%s",
+        test_fraction,
         mapped_parquet_path,
-        max_rows=fit_rows,
-        chunk_size=chunk_size,
-        random_state=42,
-        strategy="uniform",
     )
-    engineered_fit = engineer_features(fit_sample)
-    fitted.fit_transform(engineered_fit)
-    feature_context = build_feature_context(fit_sample)
-    save_joblib(feature_context, PROCESSED_DATA_DIR.parent.parent / "models" / "feature_context.pkl")
-    del fit_sample, engineered_fit
+    plan = _scan_period_plan(mapped_parquet_path, chunk_size, test_fraction)
+    cutoffs = plan["cutoffs"]
+    global_amount_mean = plan["global_amount_mean"]
+    LOGGER.info(
+        "Temporal plan: %s",
+        {
+            source: {
+                "rows": plan["source_row_counts"][source],
+                "cutoff": str(cutoffs[source]),
+                "train_rows": plan["train_row_counts"][source],
+            }
+            for source in plan["ordered_sources"]
+        },
+    )
 
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        destination.unlink()
-
-    writer: pq.ParquetWriter | None = None
-    output_schema: pa.Schema | None = None
-    rows_read = 0
-    rows_removed = 0
-    total_rows = 0
-    chunk_count = 0
-    feature_names = fitted.get_feature_names()
+    engineered_path = _engineer_all_sources(
+        mapped_parquet_path,
+        chunk_size=chunk_size,
+        cutoffs=cutoffs,
+        global_amount_mean=global_amount_mean,
+    )
     try:
-        for chunk in iter_parquet_chunks(mapped_parquet_path, chunk_size, COMMON_SCHEMA):
-            input_rows = len(chunk)
-            duplicate_rows = int(chunk["transaction_id"].duplicated().sum())
-            if duplicate_rows:
-                raise ValueError(
-                    f"Processed chunk contains {duplicate_rows} duplicate transaction IDs."
-                )
-            engineered = engineer_features(chunk)
-            transformed = fitted.transform(engineered)
-            output = pd.DataFrame(transformed, columns=feature_names)
-            output.insert(0, "transaction_id", engineered["transaction_id"].astype(str).to_numpy())
-            output["fraud_label"] = engineered["fraud_label"].astype("int8").to_numpy()
-            table = pa.Table.from_pandas(output, preserve_index=False)
-            if writer is None:
-                output_schema = table.schema
-                writer = pq.ParquetWriter(
-                    destination,
-                    output_schema,
-                    compression=DEFAULT_PARQUET_COMPRESSION,
-                    use_dictionary=True,
-                )
-            else:
-                table = table.cast(output_schema, safe=False)
-            writer.write_table(table, row_group_size=len(output))
-            rows_read += input_rows
-            total_rows += len(output)
-            chunk_count += 1
-            if chunk_count == 1 or chunk_count % 10 == 0:
-                LOGGER.info(
-                    "Preprocessed Parquet chunks=%s rows_read=%s rows_removed=%s rows_written=%s",
-                    chunk_count,
-                    rows_read,
-                    rows_removed,
-                    total_rows,
-                )
-            del chunk, engineered, transformed, output, table
-    finally:
-        if writer is not None:
-            writer.close()
+        fit_sample = load_engineered_sample(engineered_path, max_rows=fit_rows, chunk_size=chunk_size)
+        LOGGER.info("Fitting preprocessor on %s training-period rows", len(fit_sample))
+        fitted.fit_transform(fit_sample)
+        feature_context = build_feature_context(fit_sample)
+        save_joblib(feature_context, PROCESSED_DATA_DIR.parent.parent / "models" / "feature_context.pkl")
+        del fit_sample
 
-    save_joblib(fitted, PROCESSED_DATA_DIR / "chunk_preprocessor.pkl")
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            destination.unlink()
+
+        writer: pq.ParquetWriter | None = None
+        output_schema: pa.Schema | None = None
+        total_rows = 0
+        rows_read = 0
+        rows_removed = 0
+        chunk_count = 0
+        feature_names = fitted.get_feature_names()
+        try:
+            for engineered in iter_parquet_chunks(engineered_path, chunk_size):
+                input_rows = len(engineered)
+                duplicate_rows = int(engineered["transaction_id"].duplicated().sum())
+                if duplicate_rows:
+                    raise ValueError(
+                        f"Processed chunk contains {duplicate_rows} duplicate transaction IDs."
+                    )
+                transformed = fitted.transform(engineered)
+                output = pd.DataFrame(transformed, columns=feature_names)
+                output.insert(0, "transaction_id", engineered["transaction_id"].astype(str).to_numpy())
+                output["period"] = engineered["period"].astype(str).to_numpy()
+                output["fraud_label"] = engineered["fraud_label"].astype("int8").to_numpy()
+                table = pa.Table.from_pandas(output, preserve_index=False)
+                if writer is None:
+                    output_schema = table.schema
+                    writer = pq.ParquetWriter(
+                        destination,
+                        output_schema,
+                        compression=DEFAULT_PARQUET_COMPRESSION,
+                        use_dictionary=True,
+                    )
+                else:
+                    table = table.cast(output_schema, safe=False)
+                writer.write_table(table, row_group_size=len(output))
+                rows_read += input_rows
+                total_rows += len(output)
+                chunk_count += 1
+                if chunk_count == 1 or chunk_count % 10 == 0:
+                    LOGGER.info(
+                        "Preprocessed Parquet chunks=%s rows_read=%s rows_removed=%s rows_written=%s",
+                        chunk_count,
+                        rows_read,
+                        rows_removed,
+                        total_rows,
+                    )
+                del engineered, transformed, output, table
+        finally:
+            if writer is not None:
+                writer.close()
+    finally:
+        engineered_path.unlink(missing_ok=True)
+
     if writer is None:
         raise ValueError("No rows were available for streamed preprocessing.")
+    save_joblib(fitted, PROCESSED_DATA_DIR / "chunk_preprocessor.pkl")
     return fitted, {
         "path": str(destination),
         "rows": total_rows,
@@ -524,6 +606,193 @@ def stream_preprocess_to_parquet(
         "rows_written": total_rows,
         "chunks": chunk_count,
     }
+
+
+def _scan_period_plan(
+    parquet_path: Path | str,
+    chunk_size: int,
+    test_fraction: float,
+) -> dict[str, object]:
+    """Light streaming pass returning per-source cutoffs and train-period stats."""
+    source_parts: list[pd.Series] = []
+    timestamp_parts: list[pd.Series] = []
+    amount_parts: list[pd.Series] = []
+    for chunk in iter_parquet_chunks(parquet_path, chunk_size, ["transaction_id", "timestamp", "amount"]):
+        source_parts.append(_source_prefixes(chunk["transaction_id"]))
+        timestamp_parts.append(safe_datetime(pd.Series(chunk["timestamp"], copy=False)))
+        amount_parts.append(pd.to_numeric(chunk["amount"], errors="coerce"))
+        del chunk
+
+    sources = pd.concat(source_parts, ignore_index=True) if source_parts else pd.Series(dtype="object")
+    timestamps = pd.concat(timestamp_parts, ignore_index=True) if timestamp_parts else pd.Series(dtype="datetime64[ns]")
+    amounts = pd.concat(amount_parts, ignore_index=True).fillna(0.0) if amount_parts else pd.Series(dtype="float64")
+
+    ordered_sources = list(dict.fromkeys(sources.tolist()))
+    cutoffs: dict[str, pd.Timestamp] = {}
+    for source in ordered_sources:
+        source_timestamps = timestamps.loc[sources == source].dropna()
+        if source_timestamps.empty:
+            cutoffs[source] = pd.Timestamp("2024-01-01")
+        else:
+            cutoffs[source] = source_timestamps.quantile(1.0 - test_fraction)
+
+    cutoff_series = sources.map(cutoffs)
+    train_mask = timestamps.notna() & (timestamps <= cutoff_series)
+    train_counts = (
+        train_mask.groupby(sources, sort=False).sum().astype(int).to_dict()
+        if not sources.empty
+        else {}
+    )
+
+    train_amounts = amounts.loc[train_mask].astype("float64")
+    global_amount_mean = float(train_amounts.mean()) if len(train_amounts) else 0.0
+    return {
+        "ordered_sources": ordered_sources,
+        "cutoffs": cutoffs,
+        "global_amount_mean": global_amount_mean,
+        "source_row_counts": sources.value_counts().to_dict(),
+        "train_row_counts": train_counts,
+    }
+
+
+def _iter_source_blocks(
+    parquet_path: Path | str,
+    chunk_size: int,
+    columns: list[str],
+) -> Iterator[tuple[str, pd.DataFrame]]:
+    """Yield one complete source dataset per yield by buffering until the prefix changes."""
+    buffer: list[pd.DataFrame] = []
+    current_source: str | None = None
+
+    def flush() -> tuple[str, pd.DataFrame]:
+        nonlocal buffer, current_source
+        block = pd.concat(buffer, ignore_index=True)
+        source = current_source
+        buffer = []
+        current_source = None
+        assert source is not None
+        return source, block
+
+    for chunk in iter_parquet_chunks(parquet_path, chunk_size, columns):
+        prefixes = _source_prefixes(chunk["transaction_id"])
+        for source, group in chunk.groupby(prefixes, sort=False):
+            key = str(source)
+            if current_source is None:
+                current_source = key
+            elif key != current_source:
+                yield flush()
+                current_source = key
+            buffer.append(group)
+        del chunk
+    if buffer:
+        yield flush()
+
+
+def _engineer_all_sources(
+    mapped_parquet_path: Path | str,
+    chunk_size: int,
+    cutoffs: dict[str, pd.Timestamp],
+    global_amount_mean: float,
+) -> Path:
+    """Engineer every source block once and persist it to a temporary Parquet file."""
+    engineered_path = PROCESSED_DATA_DIR / "engineered_pit_intermediate.parquet"
+    engineered_path.parent.mkdir(parents=True, exist_ok=True)
+    engineered_path.unlink(missing_ok=True)
+
+    writer: pq.ParquetWriter | None = None
+    output_schema: pa.Schema | None = None
+    try:
+        for source, block in _iter_source_blocks(mapped_parquet_path, chunk_size, COMMON_SCHEMA):
+            LOGGER.info("Engineering source %s: %s rows", source, len(block))
+            engineered = _engineer_block(block, source, cutoffs[source], global_amount_mean)
+            del block
+            table = pa.Table.from_pandas(engineered, preserve_index=False)
+            if writer is None:
+                output_schema = table.schema
+                writer = pq.ParquetWriter(
+                    engineered_path,
+                    output_schema,
+                    compression=DEFAULT_PARQUET_COMPRESSION,
+                    use_dictionary=True,
+                )
+            else:
+                table = table.cast(output_schema, safe=False)
+            writer.write_table(table, row_group_size=min(len(engineered), 500_000))
+            LOGGER.info(
+                "Engineered source %s complete: columns=%s periods=%s",
+                source,
+                len(engineered.columns),
+                engineered["period"].value_counts().to_dict(),
+            )
+            del engineered, table
+    finally:
+        if writer is not None:
+            writer.close()
+    return engineered_path
+
+
+def _engineer_block(
+    block: pd.DataFrame,
+    source: str,
+    cutoff: pd.Timestamp,
+    global_amount_mean: float,
+) -> pd.DataFrame:
+    """Apply causal features plus train-fitted flags to one full source block."""
+    working = block.copy()
+    working["timestamp"] = safe_datetime(working["timestamp"]).fillna(pd.Timestamp("2024-01-01"))
+    working["timestamp"] = working["timestamp"].astype("datetime64[ns]")
+    working["amount"] = pd.to_numeric(working["amount"], errors="coerce").fillna(0.0)
+    for column in ["sender_id", "receiver_id", "merchant_category", "device_type", "location"]:
+        working[column] = working[column].astype(str)
+
+    working = add_temporal_features(working)
+    working = apply_point_in_time_features(working)
+
+    train_mask = working["timestamp"] <= pd.Timestamp(cutoff)
+    constants = fit_feature_constants(working.loc[train_mask])
+    constants["global_amount_mean"] = float(global_amount_mean)
+    engineered = apply_fitted_features(working, constants)
+    engineered["period"] = np.where(train_mask, "train", "test").astype(object)
+    engineered.attrs["source"] = source
+    return engineered
+
+
+def load_engineered_sample(
+    engineered_path: Path | str,
+    max_rows: int,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Draw a bounded training-period sample from the engineered intermediate file."""
+    return sample_parquet_rows(
+        engineered_path,
+        max_rows=max_rows,
+        chunk_size=chunk_size,
+        random_state=random_state,
+        strategy="uniform",
+        period_value="train",
+    )
+
+
+def load_period_frame(
+    processed_path: Path | str,
+    period: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> pd.DataFrame:
+    """Stream-load all processed rows belonging to one period label."""
+    parts: list[pd.DataFrame] = []
+    for chunk in iter_parquet_chunks(processed_path, chunk_size):
+        if "period" in chunk.columns:
+            selected = chunk.loc[chunk["period"].astype(str) == period]
+            if not selected.empty:
+                parts.append(selected.copy())
+        elif period == "train":
+            parts.append(chunk.copy())
+    if not parts:
+        return pd.DataFrame()
+    frame = pd.concat(parts, ignore_index=True)
+    LOGGER.info("Loaded period=%s from %s: %s rows", period, processed_path, len(frame))
+    return frame
 
 
 def _available_columns(path: Path) -> list[str]:

@@ -7,13 +7,17 @@ import json
 import sys
 from pathlib import Path
 
+import joblib
+
 from src.anomaly_detection import train_anomaly_models
 from src.parquet_pipeline import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FIT_ROWS,
+    DEFAULT_TEST_FRACTION,
     MAPPED_PARQUET_PATH,
     PROCESSED_FEATURES_PARQUET_PATH,
     ParquetPipelineConfig,
+    load_period_frame,
     sample_parquet_rows,
     stream_preprocess_to_parquet,
     write_mapped_parquet,
@@ -21,6 +25,7 @@ from src.parquet_pipeline import (
 from src.parquet_stats import parquet_label_counts
 from src.supervised_model import train_supervised_models
 from src.utils import (
+    PROCESSED_DATA_DIR,
     PROJECT_ROOT,
     REPORTS_DIR,
     ensure_project_dirs,
@@ -66,6 +71,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200_000,
         help="Bounded stratified rows for anomaly batch training",
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=DEFAULT_TEST_FRACTION,
+        help=(
+            "Fraction of each source's most recent transactions held out as the "
+            f"out-of-time evaluation period (default: {DEFAULT_TEST_FRACTION})"
+        ),
     )
     parser.add_argument(
         "--mapped-parquet",
@@ -123,6 +137,15 @@ def main() -> int:
     def ensure_processed_parquet() -> Path:
         nonlocal preprocessor
         ensure_mapped_parquet()
+        saved_preprocessor = PROCESSED_DATA_DIR / "chunk_preprocessor.pkl"
+        if (
+            preprocessor is None
+            and config.processed_path.exists()
+            and saved_preprocessor.exists()
+        ):
+            preprocessor = joblib.load(saved_preprocessor)
+            print("Reusing existing processed Parquet and fitted preprocessor.")
+            return config.processed_path
         if preprocessor is None or not config.processed_path.exists():
             preprocessor, stats = stream_preprocess_to_parquet(
                 mapped_parquet_path=mapped_path,
@@ -130,6 +153,7 @@ def main() -> int:
                 preprocessor=preprocessor,
                 fit_rows=config.fit_rows,
                 chunk_size=config.chunk_size,
+                test_fraction=args.test_fraction,
             )
             save_joblib(preprocessor, PROJECT_ROOT / "models" / "preprocessor.pkl")
             save_joblib(preprocessor, PROJECT_ROOT / "models" / "scaler.pkl")
@@ -197,17 +221,22 @@ def main() -> int:
             columns=None,
             strategy="fraud_preserving",
             legitimate_ratio=args.legitimate_ratio,
+            period_value="train",
         )
         print(
-            "Using fraud-preserving supervised sample: "
+            "Using fraud-preserving supervised sample (training period only): "
             f"{supervised_sample.shape}, legitimate_ratio={args.legitimate_ratio:.2f}"
         )
+        evaluation_frame = load_period_frame(processed_path, "test", config.chunk_size)
+        print(f"Out-of-time evaluation frame: {evaluation_frame.shape}")
         supervised_results = train_supervised_models(
             supervised_sample,
             max_rows=len(supervised_sample),
             preprocessor=preprocessor,
             preprocessed=True,
+            evaluation_frame=evaluation_frame,
         )
+        del evaluation_frame
         label_counts = parquet_label_counts(processed_path, config.chunk_size)
         total_label_rows = max(1, sum(label_counts.values()))
         population_fraud_rate = label_counts[1] / total_label_rows
@@ -241,8 +270,9 @@ def main() -> int:
             random_state=42,
             columns=None,
             strategy="uniform",
+            period_value="train",
         )
-        print(f"Using uniform anomaly sample: {anomaly_sample.shape}")
+        print(f"Using uniform anomaly sample (training period only): {anomaly_sample.shape}")
         anomaly_results = train_anomaly_models(
             anomaly_sample,
             max_rows=len(anomaly_sample),
