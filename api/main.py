@@ -64,6 +64,19 @@ def get_prediction_engine() -> PredictionEngine:
     return PredictionEngine(MODELS_DIR)
 
 
+@lru_cache(maxsize=1)
+def get_fusion_threshold_overrides() -> dict[str, Any] | None:
+    """Load tuned fusion thresholds saved by the offline pipeline."""
+    path = MODELS_DIR / "fusion_thresholds.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload.get("thresholds") or None
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Return API health status."""
@@ -77,6 +90,9 @@ def model_status() -> dict[str, Any]:
     artifacts = {
         "xgboost_model": (MODELS_DIR / "xgboost_model.pkl").exists(),
         "random_forest": (MODELS_DIR / "random_forest.pkl").exists(),
+        "xgboost_calibrator": (MODELS_DIR / "xgboost_model_calibrator.pkl").exists(),
+        "random_forest_calibrator": (MODELS_DIR / "random_forest_calibrator.pkl").exists(),
+        "fusion_thresholds": (MODELS_DIR / "fusion_thresholds.json").exists(),
         "isolation_forest": (MODELS_DIR / "isolation_forest.pkl").exists(),
         "lof_model": (MODELS_DIR / "lof_model.pkl").exists(),
         "preprocessor": (MODELS_DIR / "preprocessor.pkl").exists(),
@@ -172,6 +188,7 @@ def predict(payload: TransactionRequest) -> dict[str, Any]:
             prediction["supervised"],
             prediction["anomaly"],
             diagnostics,
+            thresholds=get_fusion_threshold_overrides(),
         )
         report = build_transaction_report(
             transaction,

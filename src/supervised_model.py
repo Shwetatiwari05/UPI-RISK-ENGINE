@@ -26,6 +26,15 @@ from sklearn.model_selection import train_test_split
 
 from src.data_preprocessing import PreprocessingConfig, UPITransactionPreprocessor
 from src.feature_engineering import engineer_features
+from src.probability_calibration import (
+    MIN_CALIBRATION_POSITIVES,
+    apply_isotonic_calibration,
+    calibration_diagnostics,
+    choose_alert_threshold,
+    fit_isotonic_calibrator,
+    save_isotonic_calibrator,
+    save_reliability_diagram,
+)
 from src.sampling import balanced_binary_sample
 from src.utils import MODELS_DIR, REPORTS_DIR, get_logger, save_joblib
 
@@ -50,6 +59,8 @@ def train_supervised_models(
     preprocessor: UPITransactionPreprocessor | None = None,
     preprocessed: bool = False,
     evaluation_frame: pd.DataFrame | None = None,
+    calibration_frame: pd.DataFrame | None = None,
+    alert_min_precision: float = 0.25,
 ) -> dict[str, Any]:
     """Train XGBoost and Random Forest models once on a bounded batch.
 
@@ -60,6 +71,12 @@ def train_supervised_models(
     When ``evaluation_frame`` is provided (the processed evaluation-period
     rows), models train on the full training frame and are scored strictly
     out-of-time; otherwise an in-sample random split is used.
+
+    When ``calibration_frame`` is provided, it must hold natural-prevalence
+    training-period rows that are disjoint from the training sample. Each
+    model is then wrapped with an isotonic calibrator mapping raw scores to
+    real-world fraud probabilities, and a supervised alert threshold is chosen
+    from the out-of-time precision/recall trade-off.
     """
     training_df = df.copy() if preprocessed else sample_training_data(
         df,
@@ -92,14 +109,7 @@ def train_supervised_models(
 
     if evaluation_frame is not None:
         x_train, y_train = x, y
-        eval_features = evaluation_frame.drop(
-            columns=["transaction_id", "fraud_label", "period"],
-            errors="ignore",
-        )
-        missing = [column for column in feature_names if column not in eval_features.columns]
-        if missing:
-            raise ValueError(f"Evaluation frame is missing engineered columns: {missing}")
-        x_test = eval_features[feature_names].to_numpy(dtype=np.float32, copy=False)
+        x_test = _feature_matrix(evaluation_frame, feature_names)
         y_test = pd.to_numeric(
             evaluation_frame["fraud_label"], errors="coerce"
         ).fillna(0).astype(int)
@@ -154,6 +164,19 @@ def train_supervised_models(
         probability = model.predict_proba(x_test)[:, 1]
         prediction = (probability >= 0.5).astype(int)
         metrics = evaluate_classifier(y_test, prediction, probability)
+        calibration_info = _calibrate_model(
+            name=name,
+            model=model,
+            raw_probability=probability,
+            y_test=y_test,
+            calibration_frame=calibration_frame,
+            feature_names=feature_names,
+            alert_min_precision=alert_min_precision,
+            model_path=model_path,
+            report_path=report_path,
+        )
+        if calibration_info:
+            metrics["calibration"] = calibration_info
         results[name] = metrics
 
         save_path = model_path / ("xgboost_model.pkl" if name == "xgboost" else "random_forest.pkl")
@@ -170,6 +193,96 @@ def train_supervised_models(
     save_joblib(preprocessor, model_path / "scaler.pkl")
     save_joblib(preprocessor, model_path / "preprocessor.pkl")
     return results
+
+
+def _feature_matrix(frame: pd.DataFrame, feature_names: list[str]) -> np.ndarray:
+    """Select engineered feature columns in training order as a float matrix."""
+    features = frame.drop(
+        columns=["transaction_id", "fraud_label", "period"],
+        errors="ignore",
+    )
+    missing = [column for column in feature_names if column not in features.columns]
+    if missing:
+        raise ValueError(f"Frame is missing engineered columns: {missing}")
+    return features[feature_names].to_numpy(dtype=np.float32, copy=False)
+
+
+def _calibrate_model(
+    name: str,
+    model: Any,
+    raw_probability: np.ndarray,
+    y_test: pd.Series,
+    calibration_frame: pd.DataFrame | None,
+    feature_names: list[str],
+    alert_min_precision: float,
+    model_path: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Fit and evaluate an isotonic calibrator plus alert threshold for one model."""
+    if calibration_frame is None:
+        return {}
+    if "fraud_label" not in calibration_frame.columns:
+        raise ValueError("calibration_frame must contain fraud_label.")
+    x_cal = _feature_matrix(calibration_frame, feature_names)
+    y_cal = pd.to_numeric(calibration_frame["fraud_label"], errors="coerce").fillna(0).astype(int)
+    positive_count = int(y_cal.sum())
+    if len(np.unique(y_cal)) < 2 or positive_count < MIN_CALIBRATION_POSITIVES:
+        LOGGER.warning(
+            "Skipping %s isotonic calibration: only %s positives in the "
+            "calibration frame (need at least %s).",
+            name,
+            positive_count,
+            MIN_CALIBRATION_POSITIVES,
+        )
+        return {}
+
+    LOGGER.info(
+        "Fitting isotonic calibrator for %s on %s rows (%s fraud)",
+        name,
+        len(x_cal),
+        positive_count,
+    )
+    calibrator = fit_isotonic_calibrator(model, x_cal, y_cal.to_numpy())
+    calibrated_probability = apply_isotonic_calibration(raw_probability, calibrator)
+    diagnostics = calibration_diagnostics(y_test, raw_probability, calibrated_probability)
+    if not diagnostics["monotonicity_preserved"]:
+        LOGGER.warning(
+            "%s isotonic calibrator is not monotone in the raw scores on "
+            "evaluation rows; calibration output is suspect.",
+            name,
+        )
+    save_reliability_diagram(
+        y_test,
+        raw_probability,
+        calibrated_probability,
+        report_path / f"{name}_reliability_diagram.png",
+    )
+
+    artifact = (
+        "xgboost_model_calibrator.pkl" if name == "xgboost" else f"{name}_calibrator.pkl"
+    )
+    save_isotonic_calibrator(calibrator, model_path / artifact)
+
+    alert = choose_alert_threshold(
+        y_test.to_numpy(),
+        calibrated_probability,
+        min_precision=alert_min_precision,
+    )
+    LOGGER.info(
+        "%s alert threshold %.4f -> precision=%.3f recall=%.3f (floor met=%s)",
+        name,
+        alert["alert_threshold"],
+        alert["precision_at_alert"],
+        alert["recall_at_alert"],
+        alert["met_precision_floor"],
+    )
+    return {
+        **diagnostics,
+        **alert,
+        "calibration_rows": int(len(x_cal)),
+        "calibration_fraud_rows": positive_count,
+        "calibrator_artifact": artifact,
+    }
 
 
 def sample_training_data(

@@ -10,7 +10,11 @@ import numpy as np
 import pandas as pd
 
 from src.anomaly_detection import predict_anomaly
-from src.probability_calibration import calibrate_probability_array
+from src.probability_calibration import (
+    apply_isotonic_calibration,
+    calibrate_probability_array,
+    load_isotonic_calibrator,
+)
 from src.schema_mapping import COMMON_SCHEMA
 from src.supervised_model import predict_fraud_probability
 from src.utils import MODELS_DIR, load_joblib
@@ -32,6 +36,8 @@ class PredictionEngine:
         self.anomaly_preprocessor = self._load_optional("anomaly_preprocessor.pkl") or self.supervised_preprocessor
         self.feature_context = self._load_optional("feature_context.pkl") or {}
         self.probability_calibration = self._load_probability_calibration()
+        self.isotonic_calibrator = self._load_isotonic_for_active_model()
+        self.alert_threshold = self._resolve_alert_threshold()
 
     @property
     def is_ready(self) -> bool:
@@ -63,16 +69,25 @@ class PredictionEngine:
         )
         if supervised.empty or "fraud_probability" not in supervised.columns:
             raise RuntimeError("The supervised model returned no fraud probability.")
-        supervised["fraud_probability"] = calibrate_probability_array(
-            supervised["fraud_probability"].to_numpy(),
-            self.probability_calibration,
-        )
-        supervised["fraud_prediction"] = (supervised["fraud_probability"] >= 0.5).astype(int)
-        supervised["confidence_score"] = np.maximum(
-            supervised["fraud_probability"],
-            1.0 - supervised["fraud_probability"],
-        )
+        raw_probability = supervised["fraud_probability"].to_numpy(dtype=np.float64)
+        if self.isotonic_calibrator is not None:
+            # Isotonic maps raw scores to real-world fraud probabilities using
+            # a held-out natural-prevalence calibration set.
+            calibrated = apply_isotonic_calibration(raw_probability, self.isotonic_calibrator)
+            calibration_method = "isotonic"
+        else:
+            # Legacy fallback for artifacts trained before isotonic calibration.
+            calibrated = calibrate_probability_array(
+                raw_probability, self.probability_calibration
+            )
+            calibration_method = "analytic prior correction (legacy)"
+        supervised["fraud_probability"] = calibrated
+        supervised["fraud_prediction"] = (
+            calibrated >= self.alert_threshold
+        ).astype(int)
+        supervised["confidence_score"] = np.maximum(calibrated, 1.0 - calibrated)
         supervised["model_name"] = self.supervised_model_name or "supervised_model"
+        supervised["calibration_method"] = calibration_method
         supervised["signal_status"] = "calculated"
         anomaly = predict_anomaly(
             self.anomaly_model,
@@ -93,6 +108,28 @@ class PredictionEngine:
         if not path.exists():
             return {}
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def _load_isotonic_for_active_model(self) -> Any | None:
+        """Load the calibrator matching the supervised artifact actually in use."""
+        if not self.supervised_model_name:
+            return None
+        return load_isotonic_calibrator(
+            self.model_dir / f"{self.supervised_model_name}_calibrator.pkl"
+        )
+
+    def _resolve_alert_threshold(self) -> float:
+        """Prefer the tuned per-model threshold, then the shared one, then 0.5."""
+        calibration = self.probability_calibration or {}
+        model_key = "xgboost" if self.supervised_model_name == "xgboost_model" else "random_forest"
+        per_model = (calibration.get("per_model") or {}).get(model_key) or {}
+        threshold = per_model.get("alert_threshold", calibration.get("supervised_alert_threshold"))
+        try:
+            resolved = float(threshold)
+        except (TypeError, ValueError):
+            return 0.5
+        if not np.isfinite(resolved):
+            return 0.5
+        return float(np.clip(resolved, 1e-6, 1.0 - 1e-6))
 
     def _load_first_available(self, filenames: list[str]) -> Any | None:
         for filename in filenames:
