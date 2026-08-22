@@ -124,7 +124,6 @@ def train_supervised_models(
         "random_forest": RandomForestClassifier(
             n_estimators=250,
             random_state=random_state,
-            class_weight="balanced",
             n_jobs=-1,
         )
     }
@@ -138,7 +137,7 @@ def train_supervised_models(
         subsample=0.9,
         colsample_bytree=0.9,
         eval_metric="logloss",
-        scale_pos_weight=_scale_pos_weight(y_train),
+        scale_pos_weight=1,
         random_state=random_state,
         n_jobs=-1,
     )
@@ -300,11 +299,3 @@ def save_feature_importance(model: Any, feature_names: list[str], path: Path, to
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
-
-
-def _scale_pos_weight(y: pd.Series) -> float:
-    positives = int((y == 1).sum())
-    negatives = int((y == 0).sum())
-    if positives == 0:
-        return 1.0
-    return max(1.0, negatives / positives)

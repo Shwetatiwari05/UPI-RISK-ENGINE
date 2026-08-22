@@ -1,9 +1,9 @@
 {
   "population_fraud_rate": 0.004066930628326651,
-  "effective_training_fraud_rate": 0.5,
+  "effective_training_fraud_rate": 0.25,
   "label_counts": {
     "0": 7188864,
     "1": 29356
   },
-  "method": "class-weight prior correction"
+  "method": "fraud-preserving sampling (3:1, no class weighting)"
 }

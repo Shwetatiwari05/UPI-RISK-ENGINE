@@ -242,9 +242,9 @@ def main() -> int:
         population_fraud_rate = label_counts[1] / total_label_rows
         calibration_metadata = {
             "population_fraud_rate": population_fraud_rate,
-            "effective_training_fraud_rate": 0.50,
+            "effective_training_fraud_rate": 0.25,
             "label_counts": label_counts,
-            "method": "class-weight prior correction",
+            "method": "fraud-preserving sampling (3:1, no class weighting)",
         }
         (PROJECT_ROOT / "models" / "fraud_probability_calibration.json").write_text(
             json.dumps(calibration_metadata, indent=2),
