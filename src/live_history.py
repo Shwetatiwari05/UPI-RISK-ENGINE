@@ -158,7 +158,12 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
 
 
 def _iso_timestamp(value: Any) -> str | None:
-    """Normalize a timestamp-like value to an ISO-8601 string."""
+    """Normalize a timestamp-like value to a tz-naive ISO-8601 string.
+
+    Aware values are converted to UTC and stripped of their offset, matching
+    the ``safe_datetime`` convention used by the feature pipeline, so every
+    stored timestamp compares cleanly against scoring-frame timestamps.
+    """
     if value is None:
         return None
     try:
@@ -167,4 +172,6 @@ def _iso_timestamp(value: Any) -> str | None:
         return None
     if parsed is pd.NaT or pd.isna(parsed):
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.tz_convert("UTC").tz_localize(None)
     return parsed.isoformat()
