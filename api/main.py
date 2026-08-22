@@ -227,6 +227,15 @@ def run_model_prediction(engine: PredictionEngine, transaction: dict[str, Any]) 
             "confidence_score": float(supervised["confidence_score"]),
             "model_name": str(supervised.get("model_name", "supervised_model")),
             "signal_status": str(supervised.get("signal_status", "calculated")),
+            **(
+                {
+                    "fraud_probability_rank": float(
+                        supervised["fraud_probability_rank"]
+                    )
+                }
+                if "fraud_probability_rank" in supervised
+                else {}
+            ),
         },
         "anomaly": {
             "anomaly_score": float(anomaly["anomaly_score"]),

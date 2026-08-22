@@ -11,6 +11,7 @@ whose model artifacts predate isotonic calibration.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.utils import load_joblib, save_joblib
 
 
 MIN_CALIBRATION_POSITIVES = 500
+DEFAULT_RANK_GRID_BINS = 999
 
 
 def correct_prior_probability(
@@ -293,3 +295,65 @@ def build_calibration_metadata(
     if preferred_threshold is not None:
         metadata["supervised_alert_threshold"] = preferred_threshold
     return metadata
+
+
+def build_score_rank_grid(
+    scores: Any, bins: int = DEFAULT_RANK_GRID_BINS
+) -> np.ndarray:
+    """Build a quantile grid representing the reference score distribution.
+
+    The grid lets serving code map a new score to its population percentile
+    without keeping the full calibration sample in memory. Quantile spacing
+    keeps resolution where the data actually lives.
+    """
+    values = np.asarray(scores, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        raise ValueError("Cannot build a rank grid from an empty score array.")
+    quantiles = np.linspace(0.0, 1.0, num=max(int(bins), 2))
+    grid = np.unique(np.quantile(values, quantiles))
+    return np.clip(grid, 0.0, 1.0)
+
+
+def score_to_percentile(grid: Any, scores: Any) -> np.ndarray:
+    """Map scores to their percentile within the persisted reference grid."""
+    reference = np.sort(np.asarray(grid, dtype=np.float64).ravel())
+    if reference.size < 2:
+        raise ValueError("Rank grid needs at least two points.")
+    values = np.clip(np.asarray(scores, dtype=np.float64).ravel(), 0.0, 1.0)
+    positions = np.searchsorted(reference, values, side="right")
+    return np.clip(positions / float(reference.size), 0.0, 1.0)
+
+
+def save_score_rank_grid(
+    grid: Any,
+    output_path: Path | str,
+    artifact: str,
+    calibrator: str,
+    reference_rows: int,
+) -> Path:
+    """Persist the supervised-score rank grid alongside model artifacts."""
+    path = Path(output_path)
+    payload = {
+        "artifact": artifact,
+        "calibrator_artifact": calibrator,
+        "reference_rows": int(reference_rows),
+        "grid": [round(float(value), 8) for value in np.asarray(grid).ravel()],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def load_score_rank_grid(path: Path | str) -> dict[str, Any] | None:
+    """Load the persisted rank grid; returns None when absent or unreadable."""
+    grid_path = Path(path)
+    if not grid_path.exists():
+        return None
+    try:
+        payload = json.loads(grid_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    grid = payload.get("grid")
+    if not isinstance(grid, list) or len(grid) < 2:
+        return None
+    return payload

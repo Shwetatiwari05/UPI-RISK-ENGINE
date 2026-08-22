@@ -14,6 +14,8 @@ from src.probability_calibration import (
     apply_isotonic_calibration,
     calibrate_probability_array,
     load_isotonic_calibrator,
+    load_score_rank_grid,
+    score_to_percentile,
 )
 from src.schema_mapping import COMMON_SCHEMA
 from src.supervised_model import predict_fraud_probability
@@ -38,6 +40,7 @@ class PredictionEngine:
         self.probability_calibration = self._load_probability_calibration()
         self.isotonic_calibrator = self._load_isotonic_for_active_model()
         self.alert_threshold = self._resolve_alert_threshold()
+        self.rank_grid = self._load_rank_grid_for_active_model()
 
     @property
     def is_ready(self) -> bool:
@@ -82,6 +85,12 @@ class PredictionEngine:
             )
             calibration_method = "analytic prior correction (legacy)"
         supervised["fraud_probability"] = calibrated
+        if self.rank_grid is not None:
+            # Population rank of the calibrated score; fuse_signals compares
+            # this percentile against the anomaly percentile (like with like).
+            supervised["fraud_probability_rank"] = score_to_percentile(
+                self.rank_grid["grid"], calibrated
+            )
         supervised["fraud_prediction"] = (
             calibrated >= self.alert_threshold
         ).astype(int)
@@ -116,6 +125,17 @@ class PredictionEngine:
         return load_isotonic_calibrator(
             self.model_dir / f"{self.supervised_model_name}_calibrator.pkl"
         )
+
+    def _load_rank_grid_for_active_model(self) -> dict[str, Any] | None:
+        """Load the score rank grid when it matches the active artifact."""
+        if not self.supervised_model_name:
+            return None
+        payload = load_score_rank_grid(self.model_dir / "supervised_rank_grid.json")
+        if payload is None:
+            return None
+        if payload.get("artifact") != f"{self.supervised_model_name}.pkl":
+            return None
+        return payload
 
     def _resolve_alert_threshold(self) -> float:
         """Prefer the tuned per-model threshold, then the shared one, then 0.5."""

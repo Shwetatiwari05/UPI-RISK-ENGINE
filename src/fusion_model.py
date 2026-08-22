@@ -34,7 +34,14 @@ DEFAULT_FUSION_THRESHOLDS: dict[str, float] = {
     "ambiguous_disagreement_threshold": 0.45,
 }
 
-REVIEW_BAND_RATIO = 0.80
+INFORMED_RANK_FLOOR = 0.95
+LOGIT_CLIP = 1e-6
+
+AMBIGUITY_WEIGHTS = {
+    "disagreement": 0.50,
+    "supervised_uncertainty": 0.35,
+    "repeatability_penalty": 0.15,
+}
 
 
 def resolve_thresholds(overrides: dict[str, Any] | None = None) -> dict[str, float]:
@@ -45,6 +52,85 @@ def resolve_thresholds(overrides: dict[str, Any] | None = None) -> dict[str, flo
             if key in merged:
                 merged[key] = _unit_interval(value)
     return merged
+
+
+def ambiguity_components(
+    fraud_probability: float,
+    unusualness_percentile: float,
+    supervised_rank: float | None,
+    supervised_gate: float,
+    repeatability_penalty: float = 0.0,
+) -> tuple[float, float, float]:
+    """Return (disagreement, uncertainty, ambiguity_score) for one transaction.
+
+    When a population rank for the supervised probability is available the
+    redesigned scale-aware formulas apply; otherwise the legacy analytic
+    behaviour is preserved for older artifacts.
+    """
+    disagreement_array, uncertainty_array = ambiguity_arrays(
+        [fraud_probability],
+        [unusualness_percentile],
+        None if supervised_rank is None else [supervised_rank],
+        supervised_gate,
+    )
+    ambiguity_score = combine_ambiguity(
+        disagreement_array[0], uncertainty_array[0], repeatability_penalty
+    )
+    return (
+        float(disagreement_array[0]),
+        float(uncertainty_array[0]),
+        float(ambiguity_score),
+    )
+
+
+def ambiguity_arrays(
+    fraud_probabilities: Any,
+    unusualness_percentiles: Any,
+    supervised_ranks: Any | None,
+    supervised_gate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized (disagreement, uncertainty) matching serving semantics.
+
+    Disagreement compares the supervised probability's population rank against
+    the anomaly percentile - like with like - and only counts when at least one
+    signal claims top-tier risk (the "informed region"), because two
+    near-independent percentiles differ by more than 0.45 roughly a third of
+    the time by pure chance. Uncertainty is a Gaussian kernel around the
+    supervised evidence gate in logit space; distance from 0.5 was meaningless
+    once honest probabilities collapsed to ~0.4% prevalence.
+    """
+    p = np.clip(np.asarray(fraud_probabilities, dtype=np.float64).ravel(), 0.0, 1.0)
+    apct = np.clip(
+        np.asarray(unusualness_percentiles, dtype=np.float64).ravel(), 0.0, 1.0
+    )
+    if supervised_ranks is None:
+        return np.abs(p - apct), 1.0 - np.abs((2.0 * p) - 1.0)
+    rank = np.clip(np.asarray(supervised_ranks, dtype=np.float64).ravel(), 0.0, 1.0)
+    if len(rank) != len(p):
+        raise ValueError("Supervised ranks must align with probabilities.")
+    informed = np.maximum(rank, apct) >= INFORMED_RANK_FLOOR
+    disagreement = np.where(informed, np.abs(rank - apct), 0.0)
+    gate = float(np.clip(supervised_gate, LOGIT_CLIP, 1.0 - LOGIT_CLIP))
+    delta = _logit(p) - _logit(gate)
+    uncertainty = np.exp(-0.5 * delta * delta)
+    return disagreement, uncertainty
+
+
+def combine_ambiguity(
+    disagreement: Any, uncertainty: Any, repeatability_penalty: float = 0.0
+) -> Any:
+    """Apply the fixed ambiguity weights to component signals."""
+    return (
+        AMBIGUITY_WEIGHTS["disagreement"] * np.asarray(disagreement, dtype=np.float64)
+        + AMBIGUITY_WEIGHTS["supervised_uncertainty"]
+        * np.asarray(uncertainty, dtype=np.float64)
+        + AMBIGUITY_WEIGHTS["repeatability_penalty"] * float(repeatability_penalty)
+    )
+
+
+def _logit(value: Any) -> Any:
+    clipped = np.clip(value, LOGIT_CLIP, 1.0 - LOGIT_CLIP)
+    return np.log(clipped / (1.0 - clipped))
 
 
 def fuse_signals(
@@ -66,18 +152,21 @@ def fuse_signals(
         anomaly.get("anomaly_percentile", anomaly.get("anomaly_confidence", 0.0))
     )
     resolved_thresholds = resolve_thresholds(thresholds)
+    supervised_rank = supervised.get("fraud_probability_rank")
+    if supervised_rank is not None:
+        supervised_rank = _unit_interval(supervised_rank)
 
-    disagreement = abs(fraud_probability - unusualness_percentile)
-    supervised_uncertainty = 1.0 - abs((2.0 * fraud_probability) - 1.0)
     repeatability_penalty = _repeatability_penalty(diagnostics)
     fusion_score = (
         FUSION_WEIGHTS["supervised_fraud_probability"] * fraud_probability
         + FUSION_WEIGHTS["unsupervised_unusualness_percentile"] * unusualness_percentile
     )
-    ambiguity_score = (
-        0.50 * disagreement
-        + 0.35 * supervised_uncertainty
-        + 0.15 * repeatability_penalty
+    disagreement, supervised_uncertainty, ambiguity_score = ambiguity_components(
+        fraud_probability,
+        unusualness_percentile,
+        supervised_rank,
+        resolved_thresholds["fraud_likely_requires_supervised_probability"],
+        repeatability_penalty,
     )
 
     fraud_likely_threshold = resolved_thresholds["fraud_likely_fusion_threshold"]
@@ -114,7 +203,13 @@ def fuse_signals(
         "repeatability_penalty": round(float(repeatability_penalty), 6),
         "weights": FUSION_WEIGHTS.copy(),
         "thresholds": resolved_thresholds,
-        "method": "Weighted dual-signal score with disagreement and uncertainty review band",
+        "method": (
+            "Weighted dual-signal score with rank-scale disagreement and "
+            "gate-centred uncertainty"
+            if supervised_rank is not None
+            else "Weighted dual-signal score with disagreement and uncertainty "
+            "review band (legacy probability scale)"
+        ),
     }
 
 
@@ -122,67 +217,69 @@ def tune_fusion_thresholds(
     supervised_probabilities: Any,
     anomaly_percentiles: Any,
     y_true: Any,
+    supervised_ranks: Any | None = None,
+    gate_floor: float = 0.0,
     min_fraud_precision: float = 0.40,
-    review_band_ratio: float = REVIEW_BAND_RATIO,
+    review_target_share: float = 0.10,
+    review_min_share: float = 0.05,
+    review_max_share: float = 0.15,
+    review_min_precision: float = 0.02,
     gate_quantiles: int = 24,
 ) -> dict[str, Any]:
-    """Sweep operating points on out-of-time data and pick FRAUD_LIKELY thresholds.
+    """Sweep operating points on out-of-time data for both resolution bands.
 
     Simulates the exact ``fuse_signals`` resolution path (including the
     ambiguity-first gate, minus the single-transaction repeatability penalty
-    that has no meaning in batch scoring). For a grid of calibrated
-    supervised-probability gates, the fused-score boundary is swept to find the
-    maximum-recall point whose precision meets ``min_fraud_precision`` under
-    the joint rule ``not ambiguous and fusion_score >= T and
-    fraud_probability >= gate``. When no combination reaches the floor, the
-    best-F1 point is returned with ``target_precision_met=False``. The review
-    band is set proportionally below the chosen fraud-likely threshold.
+    that has no meaning in batch scoring).
+
+    FRAUD_LIKELY: for a grid of calibrated supervised-probability gates - none
+    below ``gate_floor`` so the label always requires supervised corroboration -
+    the fused-score boundary is swept for the maximum-recall point whose
+    precision meets ``min_fraud_precision``. When rank data is supplied, the
+    ambiguity uncertainty kernel is centred on each candidate gate during the
+    sweep and then re-centred on the chosen gate so the tuned mask matches
+    serving semantics exactly.
+
+    AMBIGUOUS_REVIEW: the review threshold is chosen from out-of-time score
+    quantiles so the resulting band captures a share of traffic close to
+    ``review_target_share`` while staying inside [``review_min_share``,
+    ``review_max_share``] and above ``review_min_precision``. Constraints relax
+    deterministically (precision floor first, then the share window) when the
+    target is unattainable, and the metadata reports which constraints held.
     """
-    p = np.asarray(supervised_probabilities, dtype=np.float64).ravel()
-    unusualness = np.asarray(anomaly_percentiles, dtype=np.float64).ravel()
+    p = np.clip(np.asarray(supervised_probabilities, dtype=np.float64).ravel(), 0.0, 1.0)
+    unusualness = np.clip(np.asarray(anomaly_percentiles, dtype=np.float64).ravel(), 0.0, 1.0)
     y = np.asarray(y_true, dtype=np.int64).ravel()
     if not (len(p) == len(unusualness) == len(y)) or len(y) == 0:
         raise ValueError("Threshold tuning inputs must be non-empty and equally sized.")
     unique_labels = np.unique(y)
     if len(unique_labels) < 2:
         raise ValueError("Threshold tuning needs evaluation rows of both classes.")
+    if not (0.0 < review_min_share <= review_target_share <= review_max_share <= 1.0):
+        raise ValueError("Review share bounds must satisfy 0 < min <= target <= max <= 1.")
 
-    p_clipped = np.clip(p, 0.0, 1.0)
-    unusualness_clipped = np.clip(unusualness, 0.0, 1.0)
-    fusion_scores = (
-        FUSION_WEIGHTS["supervised_fraud_probability"] * p_clipped
-        + FUSION_WEIGHTS["unsupervised_unusualness_percentile"] * unusualness_clipped
-    )
-    # Reproduce the ambiguity-first gate from fuse_signals (repeatability
-    # penalty is zero in batch scoring).
-    signal_disagreement = np.abs(p_clipped - unusualness_clipped)
-    supervised_uncertainty = 1.0 - np.abs(2.0 * p_clipped - 1.0)
-    ambiguity_scores = (
-        0.50 * signal_disagreement + 0.35 * supervised_uncertainty
-    )
-    ambiguous_first = (
-        ambiguity_scores >= DEFAULT_FUSION_THRESHOLDS["ambiguous_score_threshold"]
-    ) | (
-        signal_disagreement
-        >= DEFAULT_FUSION_THRESHOLDS["ambiguous_disagreement_threshold"]
-    )
+    ranks: np.ndarray | None = None
+    if supervised_ranks is not None:
+        ranks = np.clip(
+            np.asarray(supervised_ranks, dtype=np.float64).ravel(), 0.0, 1.0
+        )
+        if len(ranks) != len(p):
+            raise ValueError("Supervised ranks must align with probabilities.")
+
     prevalence = float(y.mean())
     total_positives = max(int(y.sum()), 1)
-
-    gates = np.unique(
-        np.quantile(p, np.linspace(0.50, 0.999, gate_quantiles))
+    fusion_scores = (
+        FUSION_WEIGHTS["supervised_fraud_probability"] * p
+        + FUSION_WEIGHTS["unsupervised_unusualness_percentile"] * unusualness
     )
-    gates = gates[gates > 0.0]
-    if gates.size == 0:
-        gates = np.asarray([max(2.0 * prevalence, 1e-4)], dtype=np.float64)
+    score_threshold = DEFAULT_FUSION_THRESHOLDS["ambiguous_score_threshold"]
+    disagreement_threshold = DEFAULT_FUSION_THRESHOLDS["ambiguous_disagreement_threshold"]
 
-    best: dict[str, Any] | None = None
-    fallback: dict[str, Any] | None = None
-    for gate in gates:
+    def _fraud_entry(gate: float, ambiguous_first: np.ndarray) -> dict[str, Any]:
         gate_mask = (p >= gate) & ~ambiguous_first
         flagged_cap = int(gate_mask.sum())
         if flagged_cap < 10:
-            continue
+            return {}
         scores = fusion_scores[gate_mask]
         labels = y[gate_mask]
         order = np.argsort(-scores, kind="mergesort")
@@ -202,7 +299,7 @@ def tune_fusion_thresholds(
             upper = sorted_scores[index - 1] if index > 0 else sorted_scores[index] + 1.0
             boundary = float((upper + sorted_scores[index]) / 2.0)
             return {
-                "gate": float(gate),
+                "gate": round(float(gate), 8),
                 "fusion_threshold": round(float(np.clip(boundary, 0.0, 1.0)), 6),
                 "precision": round(float(precision[index]), 6),
                 "recall": round(float(recall[index]), 6),
@@ -213,45 +310,96 @@ def tune_fusion_thresholds(
 
         feasible = np.flatnonzero(precision >= min_fraud_precision)
         if feasible.size:
-            candidate = _entry(int(feasible[-1]), True)
-            if best is None or (candidate["recall"], -candidate["alerts_per_10k_rows"]) > (
-                best["recall"],
-                -best["alerts_per_10k_rows"],
-            ):
+            return _entry(int(feasible[-1]), True)
+        return _entry(int(np.argmax(f1)), False)
+
+    # Pass one: pick the gate. Ambiguity uses a provisional kernel centre so a
+    # gate exists at all; with legacy inputs (no ranks) the formulas do not
+    # depend on the gate and this equals the historical behaviour.
+    provisional_gate = (
+        float(gate_floor)
+        if gate_floor > 0.0
+        else float(max(np.quantile(p, 0.995), LOGIT_CLIP))
+    )
+    disagreement_p, uncertainty_p = ambiguity_arrays(
+        p, unusualness, ranks, provisional_gate
+    )
+    ambiguity_p = combine_ambiguity(disagreement_p, uncertainty_p)
+    ambiguous_p = (ambiguity_p >= score_threshold) | (
+        disagreement_p >= disagreement_threshold
+    )
+
+    gates = np.unique(np.quantile(p, np.linspace(0.50, 0.999, gate_quantiles)))
+    gates = gates[gates > 0.0]
+    if gate_floor > 0.0:
+        gates = gates[gates >= gate_floor]
+        gates = np.unique(np.concatenate([gates, np.asarray([float(gate_floor)])]))
+    if gates.size == 0:
+        gates = np.asarray([max(2.0 * prevalence, 1e-4)], dtype=np.float64)
+
+    best: dict[str, Any] | None = None
+    fallback: dict[str, Any] | None = None
+    for gate in gates:
+        candidate = _fraud_entry(float(gate), ambiguous_p)
+        if not candidate:
+            continue
+        if candidate["target_precision_met"]:
+            if best is None or (
+                candidate["recall"],
+                -candidate["alerts_per_10k_rows"],
+            ) > (best["recall"], -best["alerts_per_10k_rows"]):
                 best = candidate
-        else:
-            candidate = _entry(int(np.argmax(f1)), False)
-            if fallback is None or (candidate["f1"], candidate["precision"]) > (
-                fallback["f1"],
-                fallback["precision"],
-            ):
-                fallback = candidate
+        elif fallback is None or (candidate["f1"], candidate["precision"]) > (
+            fallback["f1"],
+            fallback["precision"],
+        ):
+            fallback = candidate
 
     chosen = best or fallback
     if chosen is None:
         raise ValueError("No viable threshold found; check the evaluation inputs.")
 
+    # Pass two: freeze the ambiguity kernel on the chosen gate so the tuned
+    # mask matches fuse_signals exactly, then finalise the fraud band there.
+    disagreement_f, uncertainty_f = ambiguity_arrays(
+        p, unusualness, ranks, chosen["gate"]
+    )
+    ambiguity_f = combine_ambiguity(disagreement_f, uncertainty_f)
+    ambiguous_first = (ambiguity_f >= score_threshold) | (
+        disagreement_f >= disagreement_threshold
+    )
+    finalised = _fraud_entry(chosen["gate"], ambiguous_first)
+    if finalised:
+        chosen = finalised
+
     fraud_threshold = chosen["fusion_threshold"]
-    review_threshold = round(fraud_threshold * review_band_ratio, 6)
+    chosen_gate = chosen["gate"]
     fraud_band = (
-        ~ambiguous_first
-        & (fusion_scores >= fraud_threshold)
-        & (p >= chosen["gate"])
+        ~ambiguous_first & (fusion_scores >= fraud_threshold) & (p >= chosen_gate)
     )
-    review_mask = (
-        (ambiguous_first | ((fusion_scores >= review_threshold) & (p < chosen["gate"])))
-        & ~fraud_band
+
+    review_selection = _select_review_threshold(
+        fusion_scores=fusion_scores,
+        labels=y,
+        ambiguous_first=ambiguous_first,
+        fraud_band=fraud_band,
+        total_rows=len(y),
+        target_share=review_target_share,
+        min_share=review_min_share,
+        max_share=review_max_share,
+        min_precision=review_min_precision,
     )
+    review_threshold = review_selection["threshold"]
 
     return {
         "thresholds": {
             "fraud_likely_fusion_threshold": fraud_threshold,
-            "fraud_likely_requires_supervised_probability": round(chosen["gate"], 8),
+            "fraud_likely_requires_supervised_probability": round(
+                float(chosen_gate), 8
+            ),
             "ambiguous_review_fusion_threshold": review_threshold,
-            "ambiguous_score_threshold": DEFAULT_FUSION_THRESHOLDS["ambiguous_score_threshold"],
-            "ambiguous_disagreement_threshold": DEFAULT_FUSION_THRESHOLDS[
-                "ambiguous_disagreement_threshold"
-            ],
+            "ambiguous_score_threshold": score_threshold,
+            "ambiguous_disagreement_threshold": disagreement_threshold,
         },
         "achieved": {
             "fraud_likely": {
@@ -259,18 +407,121 @@ def tune_fusion_thresholds(
                 for key, value in chosen.items()
                 if key in {"precision", "recall", "f1", "alerts_per_10k_rows"}
             },
-            "review_band": {
-                "rows": int(review_mask.sum()),
-                "fraud_rows": int(y[review_mask].sum()),
-                "precision": round(
-                    float(y[review_mask].mean()) if review_mask.any() else 0.0, 6
-                ),
-            },
+            "review_band": review_selection["achieved"],
         },
         "evaluation_rows": int(len(y)),
         "fraud_prevalence": round(prevalence, 8),
         "min_fraud_precision_target": round(float(min_fraud_precision), 4),
         "target_precision_met": bool(chosen["target_precision_met"]),
+        "gate_floor_applied": round(float(gate_floor), 8),
+        "ambiguity_mode": (
+            "rank_scale_informed_v2" if ranks is not None else "legacy_probability_scale"
+        ),
+        "review_band_config": {
+            "target_share": round(float(review_target_share), 4),
+            "min_share": round(float(review_min_share), 4),
+            "max_share": round(float(review_max_share), 4),
+            "min_precision": round(float(review_min_precision), 4),
+        },
+        "review_constraints_met": {
+            "precision_floor": bool(review_selection["precision_met"]),
+            "share_window": bool(review_selection["share_in_window"]),
+        },
+    }
+
+
+def _select_review_threshold(
+    fusion_scores: np.ndarray,
+    labels: np.ndarray,
+    ambiguous_first: np.ndarray,
+    fraud_band: np.ndarray,
+    total_rows: int,
+    target_share: float,
+    min_share: float,
+    max_share: float,
+    min_precision: float,
+) -> dict[str, Any]:
+    """Choose the review-band boundary closest to the target traffic share.
+
+    The served band is ``(ambiguous_first | fusion >= T_review)`` minus the
+    fraud band, so ambiguous rows count toward the share regardless of their
+    score. Candidates are evaluated over every distinct fused-score level of
+    the non-fraud population using cumulative counts.
+    """
+    eligible = ~fraud_band
+    scores = fusion_scores[eligible]
+    labs = labels[eligible]
+    ambiguous = ambiguous_first[eligible]
+
+    order = np.argsort(-scores, kind="mergesort")
+    s_sorted = scores[order]
+    lab_sorted = labs[order]
+    amb_sorted = ambiguous[order]
+
+    amb_total = int(amb_sorted.sum())
+    amb_fraud_total = int((amb_sorted & (lab_sorted == 1)).sum())
+    cum_tp = np.cumsum(lab_sorted)
+    cum_amb = np.cumsum(amb_sorted)
+    cum_amb_tp = np.cumsum(amb_sorted & (lab_sorted == 1))
+
+    # Only cut at the end of a tied-score block: any threshold strictly inside
+    # a tie group is unrepresentable (serving admits whole groups), and cutting
+    # mid-block would understate the served band size.
+    block_ends = np.flatnonzero(s_sorted[:-1] != s_sorted[1:])
+    positions = np.concatenate([block_ends, [len(s_sorted) - 1]])
+    review_rows = amb_total + (positions + 1) - cum_amb[positions]
+    review_fraud = amb_fraud_total + cum_tp[positions] - cum_amb_tp[positions]
+    share = review_rows / float(total_rows)
+    precision = review_fraud / np.maximum(review_rows, 1)
+
+    precision_ok = precision >= min_precision
+    share_ok = (share >= min_share) & (share <= max_share)
+    distance = np.abs(share - target_share)
+
+    def _pick(mask: np.ndarray) -> int | None:
+        if not mask.any():
+            return None
+        candidates = np.flatnonzero(mask)
+        best_distance = distance[candidates].min()
+        tied = candidates[distance[candidates] <= best_distance + 1e-12]
+        return int(tied[np.argmax(review_fraud[tied])])
+
+    index = _pick(precision_ok & share_ok)
+    precision_met = True
+    share_in_window = True
+    if index is None:
+        precision_met = False
+        index = _pick(share_ok)
+    if index is None:
+        share_in_window = False
+        precision_met = True
+        index = _pick(precision_ok)
+    if index is None:
+        precision_met = False
+        share_in_window = False
+        index = _pick(np.ones(len(s_sorted), dtype=bool))
+    if index is None:
+        raise ValueError("No review-band candidate available.")
+
+    if index + 1 < len(s_sorted):
+        boundary = float((s_sorted[index] + s_sorted[index + 1]) / 2.0)
+    else:
+        boundary = float(s_sorted[index]) / 2.0
+
+    remaining_frauds = max(int(labels.sum() - labels[fraud_band].sum()), 1)
+    return {
+        "threshold": round(float(np.clip(boundary, 0.0, 1.0)), 6),
+        "precision_met": precision_met,
+        "share_in_window": share_in_window,
+        "achieved": {
+            "rows": int(review_rows[index]),
+            "share": round(float(share[index]), 6),
+            "fraud_rows": int(review_fraud[index]),
+            "precision": round(float(precision[index]), 6),
+            "recall_of_remaining": round(
+                float(review_fraud[index] / remaining_frauds), 6
+            ),
+        },
     }
 
 

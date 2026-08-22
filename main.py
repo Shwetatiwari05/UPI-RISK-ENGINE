@@ -30,7 +30,14 @@ from src.parquet_stats import (
     parquet_label_counts,
     parquet_period_label_counts,
 )
-from src.probability_calibration import build_calibration_metadata
+from src.probability_calibration import (
+    DEFAULT_RANK_GRID_BINS,
+    build_calibration_metadata,
+    build_score_rank_grid,
+    load_score_rank_grid,
+    save_score_rank_grid,
+    score_to_percentile,
+)
 from src.supervised_model import train_supervised_models
 from src.utils import (
     MODELS_DIR,
@@ -81,6 +88,36 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Precision floor for the fused FRAUD_LIKELY operating point "
             "(default: 0.40)"
+        ),
+    )
+    parser.add_argument(
+        "--review-target-share",
+        type=float,
+        default=0.10,
+        help=(
+            "Target share of out-of-time traffic routed to the ambiguous "
+            "review band (default: 0.10)"
+        ),
+    )
+    parser.add_argument(
+        "--review-min-share",
+        type=float,
+        default=0.05,
+        help="Minimum acceptable review-band traffic share (default: 0.05)",
+    )
+    parser.add_argument(
+        "--review-max-share",
+        type=float,
+        default=0.15,
+        help="Maximum acceptable review-band traffic share (default: 0.15)",
+    )
+    parser.add_argument(
+        "--review-min-precision",
+        type=float,
+        default=0.02,
+        help=(
+            "Precision floor for the ambiguous review band, mirroring the "
+            "FRAUD_LIKELY floor (default: 0.02)"
         ),
     )
     parser.add_argument(
@@ -135,6 +172,10 @@ def tune_and_save_fusion_thresholds(
     processed_path: Path,
     chunk_size: int,
     min_fraud_precision: float,
+    review_target_share: float = 0.10,
+    review_min_share: float = 0.05,
+    review_max_share: float = 0.15,
+    review_min_precision: float = 0.02,
 ) -> dict[str, object] | None:
     """Sweep fused-score operating points on out-of-time rows and persist them.
 
@@ -159,6 +200,20 @@ def tune_and_save_fusion_thresholds(
     if pair is None or not isolation_path.exists():
         return None
 
+    rank_payload = load_score_rank_grid(MODELS_DIR / "supervised_rank_grid.json")
+    gate_floor = _resolve_gate_floor(pair[0])
+    if rank_payload is None:
+        print(
+            "Supervised rank grid missing; ambiguity falls back to the legacy "
+            "probability scale."
+        )
+    elif rank_payload.get("artifact") != pair[0]:
+        print(
+            "Supervised rank grid was built for "
+            f"{rank_payload.get('artifact')}, ignoring it for {pair[0]}."
+        )
+        rank_payload = None
+
     preprocessor = joblib.load(MODELS_DIR / "preprocessor.pkl")
     feature_names = preprocessor.get_feature_names()
     frame = load_period_frame(processed_path, "test", chunk_size)
@@ -176,6 +231,11 @@ def tune_and_save_fusion_thresholds(
         np.asarray(calibrator.predict(raw_probability), dtype=np.float64),
         0.0,
         1.0,
+    )
+    supervised_ranks = (
+        score_to_percentile(rank_payload["grid"], calibrated_probability)
+        if rank_payload is not None
+        else None
     )
 
     isolation_forest = joblib.load(isolation_path)
@@ -198,8 +258,19 @@ def tune_and_save_fusion_thresholds(
         calibrated_probability,
         unusualness_percentile,
         y_test.to_numpy(),
+        supervised_ranks=supervised_ranks,
+        gate_floor=gate_floor,
         min_fraud_precision=min_fraud_precision,
+        review_target_share=review_target_share,
+        review_min_share=review_min_share,
+        review_max_share=review_max_share,
+        review_min_precision=review_min_precision,
     )
+    if supervised_ranks is not None:
+        tuned["supervised_rank_grid"] = {
+            "artifact": rank_payload.get("artifact"),
+            "reference_rows": rank_payload.get("reference_rows"),
+        }
     tuned["tuned_at_utc"] = datetime.now(timezone.utc).isoformat()
     tuned["supervised_artifact"] = pair[0]
     output_path = MODELS_DIR / "fusion_thresholds.json"
@@ -210,8 +281,21 @@ def tune_and_save_fusion_thresholds(
         "FRAUD_LIKELY operating point: fusion>="
         f"{tuned['thresholds']['fraud_likely_fusion_threshold']:.4f}, "
         f"supervised gate={tuned['thresholds']['fraud_likely_requires_supervised_probability']:.4f} "
+        f"(floor={gate_floor:.4f}) "
         f"-> precision={fraud_band['precision']:.3f}, recall={fraud_band['recall']:.3f}, "
         f"{fraud_band['alerts_per_10k_rows']:.2f} alerts/10k rows"
+    )
+    review_band = tuned["achieved"]["review_band"]
+    constraints = tuned["review_constraints_met"]
+    print(
+        "REVIEW band: fusion>="
+        f"{tuned['thresholds']['ambiguous_review_fusion_threshold']:.4f} -> "
+        f"{review_band['rows']:,} rows ({review_band['share']:.2%} of traffic, "
+        f"target={review_target_share:.0%}), precision={review_band['precision']:.4f}, "
+        f"{review_band['fraud_rows']:,} frauds "
+        f"(recall of remaining={review_band['recall_of_remaining']:.3f}); "
+        f"precision floor met={constraints['precision_floor']}, "
+        f"share in window={constraints['share_window']}"
     )
     if not tuned["target_precision_met"]:
         print(
@@ -220,6 +304,29 @@ def tune_and_save_fusion_thresholds(
         )
     print(f"Saved fusion thresholds: {output_path}")
     return tuned
+
+
+def _resolve_gate_floor(model_artifact: str) -> float:
+    """Gate floor for FRAUD_LIKELY: the active model's tuned alert threshold.
+
+    Keeps the semantic contract that a strong fused label requires a
+    supervised fraud signal rather than anomaly unusualness alone.
+    """
+    calibration_path = MODELS_DIR / "fraud_probability_calibration.json"
+    if not calibration_path.exists():
+        return 0.0
+    try:
+        metadata = json.loads(calibration_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0.0
+    model_key = "xgboost" if model_artifact == "xgboost_model.pkl" else "random_forest"
+    per_model = (metadata.get("per_model") or {}).get(model_key) or {}
+    threshold = per_model.get("alert_threshold", metadata.get("supervised_alert_threshold"))
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        return 0.0
+    return float(np.clip(value, 1e-6, 1.0 - 1e-6)) if np.isfinite(value) else 0.0
 
 
 def _build_calibration_frame(
@@ -276,6 +383,59 @@ def _build_calibration_frame(
         f"prevalence target={population_fraud_rate:.4%}, actual={actual_prevalence:.4%}"
     )
     return frame
+
+
+def _build_supervised_rank_grid(
+    calibration_sample: pd.DataFrame, preprocessor: Any
+) -> Path | None:
+    """Persist the training-population rank grid for calibrated fraud scores.
+
+    fuse_signals compares the supervised probability's population rank against
+    the anomaly percentile; both sides must be percentiles of their own
+    reference distributions. The natural-prevalence calibration frame is the
+    best available stand-in for deployment traffic.
+    """
+    pairs = [
+        ("xgboost_model.pkl", "xgboost_model_calibrator.pkl"),
+        ("random_forest.pkl", "random_forest_calibrator.pkl"),
+    ]
+    pair = next(
+        (
+            (model_name, calibrator_name)
+            for model_name, calibrator_name in pairs
+            if (MODELS_DIR / model_name).exists()
+            and (MODELS_DIR / calibrator_name).exists()
+        ),
+        None,
+    )
+    if pair is None or preprocessor is None or calibration_sample is None:
+        return None
+
+    feature_names = preprocessor.get_feature_names()
+    features = calibration_sample.drop(
+        columns=["transaction_id", "fraud_label", "period"],
+        errors="ignore",
+    )
+    x = features[feature_names].to_numpy(dtype=np.float32, copy=False)
+    model = joblib.load(MODELS_DIR / pair[0])
+    calibrator = joblib.load(MODELS_DIR / pair[1])
+    raw = model.predict_proba(x)[:, 1]
+    calibrated = np.clip(
+        np.asarray(calibrator.predict(raw), dtype=np.float64), 0.0, 1.0
+    )
+    grid = build_score_rank_grid(calibrated, bins=DEFAULT_RANK_GRID_BINS)
+    output_path = save_score_rank_grid(
+        grid,
+        MODELS_DIR / "supervised_rank_grid.json",
+        artifact=pair[0],
+        calibrator=pair[1],
+        reference_rows=len(calibration_sample),
+    )
+    print(
+        f"Saved supervised rank grid: {len(grid)} points from "
+        f"{len(calibration_sample)} calibration rows ({pair[0]})"
+    )
+    return output_path
 
 
 def main() -> int:
@@ -472,6 +632,7 @@ def main() -> int:
             alert_min_precision=args.alert_min_precision,
         )
         del evaluation_frame
+        _build_supervised_rank_grid(calibration_sample, preprocessor)
         del calibration_sample
         del supervised_sample
         calibration_metadata = build_calibration_metadata(
@@ -535,6 +696,10 @@ def main() -> int:
             processed_path=processed_path,
             chunk_size=config.chunk_size,
             min_fraud_precision=args.fraud_likely_min_precision,
+            review_target_share=args.review_target_share,
+            review_min_share=args.review_min_share,
+            review_max_share=args.review_max_share,
+            review_min_precision=args.review_min_precision,
         )
         if tuned is None:
             print(

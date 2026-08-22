@@ -1,28 +1,46 @@
 {
   "thresholds": {
-    "fraud_likely_fusion_threshold": 0.113317,
-    "fraud_likely_requires_supervised_probability": 0.00704501,
-    "ambiguous_review_fusion_threshold": 0.090654,
+    "fraud_likely_fusion_threshold": 0.481686,
+    "fraud_likely_requires_supervised_probability": 0.09801234,
+    "ambiguous_review_fusion_threshold": 0.394729,
     "ambiguous_score_threshold": 0.38,
     "ambiguous_disagreement_threshold": 0.45
   },
   "achieved": {
     "fraud_likely": {
-      "precision": 0.40012,
-      "recall": 0.07931,
-      "f1": 0.132381,
-      "alerts_per_10k_rows": 11.74
+      "precision": 0.400048,
+      "recall": 0.199643,
+      "f1": 0.26636,
+      "alerts_per_10k_rows": 29.56
     },
     "review_band": {
-      "rows": 705120,
-      "fraud_rows": 7377,
-      "precision": 0.010462
+      "rows": 141981,
+      "share": 0.1,
+      "fraud_rows": 3857,
+      "precision": 0.027166,
+      "recall_of_remaining": 0.57302
     }
   },
   "evaluation_rows": 1419809,
   "fraud_prevalence": 0.00592333,
   "min_fraud_precision_target": 0.4,
   "target_precision_met": true,
-  "tuned_at_utc": "2026-08-22T12:15:18.684837+00:00",
+  "gate_floor_applied": 0.09801234,
+  "ambiguity_mode": "rank_scale_informed_v2",
+  "review_band_config": {
+    "target_share": 0.1,
+    "min_share": 0.05,
+    "max_share": 0.15,
+    "min_precision": 0.02
+  },
+  "review_constraints_met": {
+    "precision_floor": true,
+    "share_window": true
+  },
+  "supervised_rank_grid": {
+    "artifact": "xgboost_model.pkl",
+    "reference_rows": 1284999
+  },
+  "tuned_at_utc": "2026-08-22T13:26:40.280118+00:00",
   "supervised_artifact": "xgboost_model.pkl"
 }
