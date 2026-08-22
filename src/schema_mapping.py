@@ -106,7 +106,6 @@ COLUMN_ALIASES = {
         "device",
         "device_id",
         "DeviceType",
-        "ProductCD",
     ],
     "merchant_category": [
         "merchant_category",
@@ -138,6 +137,7 @@ COLUMN_ALIASES = {
         "fraud_label",
         "isFraud",
         "is_fraud",
+        "fraud_flag",
         "fraud",
         "fraudulent",
         "label",
