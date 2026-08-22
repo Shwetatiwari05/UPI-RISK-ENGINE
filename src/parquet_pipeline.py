@@ -203,7 +203,11 @@ def sample_parquet_rows(
     ``fraud_preserving`` keeps every fraud row when the row budget permits it,
     then samples legitimate rows at the requested ratio. Legitimate rows are
     allocated proportionally across available strata. ``uniform`` is intended
-    for unsupervised models and does not use fraud labels.
+    for unsupervised models and does not use fraud labels. ``uniform`` rows are
+    allocated proportionally across the source datasets encoded in the
+    ``transaction_id`` prefix so no single source dominates the sample purely
+    through file ordering; sources missing from that column fall back to
+    sequential chunk-order selection.
     """
     if max_rows <= 0:
         raise ValueError("max_rows must be greater than zero.")
@@ -223,6 +227,7 @@ def sample_parquet_rows(
 
     label_counts = {0: 0, 1: 0}
     legitimate_strata_counts: dict[str, int] = {}
+    source_row_counts: dict[str, int] = {}
     total_rows = 0
     for chunk in iter_parquet_chunks(parquet_path, chunk_size, selected_columns):
         total_rows += len(chunk)
@@ -235,6 +240,10 @@ def sample_parquet_rows(
             legitimate_keys = _build_strata_keys(legitimate, strata)
             for key, count in legitimate_keys.value_counts().items():
                 legitimate_strata_counts[str(key)] = legitimate_strata_counts.get(str(key), 0) + int(count)
+        elif "transaction_id" in chunk.columns:
+            sources = _source_prefixes(chunk["transaction_id"])
+            for source, count in sources.value_counts().items():
+                source_row_counts[str(source)] = source_row_counts.get(str(source), 0) + int(count)
         del chunk
 
     if total_rows == 0:
@@ -248,6 +257,18 @@ def sample_parquet_rows(
         target_rows = min(max_rows, total_rows)
         fraud_target = legitimate_target = 0
         legitimate_targets: dict[str, int] = {}
+        if source_row_counts:
+            source_quotas = _allocate_source_quotas(source_row_counts, target_rows)
+            LOGGER.info(
+                "Uniform sample allocated across sources: %s",
+                {key: value for key, value in sorted(source_quotas.items())},
+            )
+        else:
+            source_quotas: dict[str, int] = {}
+            LOGGER.warning(
+                "transaction_id is unavailable for source attribution; "
+                "uniform sampling falls back to sequential chunk order."
+            )
     else:
         fraud_count = label_counts.get(1, 0)
         legitimate_count = label_counts.get(0, 0)
@@ -271,14 +292,38 @@ def sample_parquet_rows(
 
     sampled_chunks: list[pd.DataFrame] = []
     selected_rows = 0
+    source_remaining_counts = dict(source_row_counts)
     for chunk_number, chunk in enumerate(iter_parquet_chunks(parquet_path, chunk_size, selected_columns)):
         if strategy == "uniform":
-            remaining = target_rows - selected_rows
-            selected = chunk.sample(
-                n=min(remaining, len(chunk)),
-                random_state=random_state + chunk_number,
-                replace=False,
-            ) if remaining > 0 else chunk.iloc[0:0]
+            if source_quotas:
+                pieces = []
+                sources = _source_prefixes(chunk["transaction_id"])
+                for source, group in chunk.groupby(sources, sort=False):
+                    key = str(source)
+                    quota_left = source_quotas.get(key, 0)
+                    rows_left = source_remaining_counts.get(key, 0)
+                    if quota_left <= 0 or rows_left <= 0 or group.empty:
+                        continue
+                    share = int(round(quota_left * len(group) / rows_left))
+                    n_rows = min(quota_left, len(group), max(0, share))
+                    if n_rows:
+                        pieces.append(
+                            group.sample(
+                                n=n_rows,
+                                random_state=random_state + chunk_number,
+                                replace=False,
+                            )
+                        )
+                        source_quotas[key] = quota_left - n_rows
+                    source_remaining_counts[key] = rows_left - len(group)
+                selected = pd.concat(pieces, ignore_index=True) if pieces else chunk.iloc[0:0]
+            else:
+                remaining = target_rows - selected_rows
+                selected = chunk.sample(
+                    n=min(remaining, len(chunk)),
+                    random_state=random_state + chunk_number,
+                    replace=False,
+                ) if remaining > 0 else chunk.iloc[0:0]
         else:
             values = pd.to_numeric(chunk[target_column], errors="coerce").fillna(0).astype(int)
             pieces = []
@@ -343,6 +388,36 @@ def _build_strata_keys(df: pd.DataFrame, columns: list[str]) -> pd.Series:
     for column in available:
         values[column] = values[column].astype(str).fillna("Unknown")
     return values.astype(str).agg("|".join, axis=1)
+
+
+def _source_prefixes(transaction_ids: pd.Series) -> pd.Series:
+    """Extract the dataset-source prefix encoded in each transaction id."""
+    return transaction_ids.astype(str).str.split("__", n=1).str[0]
+
+
+def _allocate_source_quotas(counts: dict[str, int], target: int) -> dict[str, int]:
+    """Allocate a bounded sample proportionally across dataset sources.
+
+    Every source present in the data receives at least one row whenever the
+    budget can cover all sources, so a small dataset is never excluded just
+    because its proportional share rounds to zero.
+    """
+    quotas = dict(_allocate_stratified_targets(counts, target))
+    active = sorted(
+        (key for key, count in counts.items() if count > 0),
+        key=lambda key: quotas.get(key, 0),
+    )
+    if target < len(active):
+        return quotas
+    for key in active:
+        if quotas.get(key, 0) > 0:
+            break
+        donor = max(quotas, key=lambda candidate: quotas[candidate])
+        if quotas.get(donor, 0) <= 1:
+            break
+        quotas[donor] -= 1
+        quotas[key] = 1
+    return quotas
 
 
 def _allocate_stratified_targets(counts: dict[str, int], target: int) -> dict[str, int]:
