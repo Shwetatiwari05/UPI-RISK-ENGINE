@@ -588,6 +588,11 @@ function FusionResolution({ fusion }) {
         <MetricReadout label="Signal disagreement" value={formatPercent(fusion.signal_disagreement)} />
         <MetricReadout label="Supervised uncertainty" value={formatPercent(fusion.supervised_uncertainty)} />
       </div>
+      {fusion.velocity_rule?.triggered && (
+        <div className="rule-override-badge">
+          Velocity-abuse rule override ({fusion.velocity_rule.flags_true.length}/{fusion.velocity_rule.min_flags} flags: {fusion.velocity_rule.flags_true.join(", ")})
+        </div>
+      )}
       <small>Research output only. It does not approve, decline, block, or prove fraud for a transaction.</small>
     </section>
   );
