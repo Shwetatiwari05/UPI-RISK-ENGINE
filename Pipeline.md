@@ -22,12 +22,17 @@ python main.py --all
 
 The stages are:
 
-1. Raw CSV/Parquet files are read in chunks and mapped to the existing common schema.
-2. The mapped rows are written to `data/merged/mapped_common_schema.parquet` with Snappy compression.
-3. A bounded sample is used to fit preprocessing state once.
-4. Every Parquet row group is feature-engineered and transformed using that same fitted state.
-5. The existing batch-only ML models train once on bounded samples selected from
-   the lossless processed Parquet output.
+1. Raw CSV/Parquet files are read in chunks and mapped to the common schema, then
+   written to `data/merged/mapped_common_schema.parquet` with Snappy compression.
+2. A bounded sample is used to fit preprocessing state once.
+3. Point-in-time feature engineering runs inside the streamed preprocessing pass.
+4. Supervised models train once on a bounded fraud-preserving sample from the
+   training period; isotonic calibrators are then fitted on a held-out,
+   natural-prevalence frame disjoint from that sample.
+5. Anomaly models train once on a uniform, label-independent sample from the
+   training period.
+6. Fusion thresholds for FRAUD_LIKELY and the ambiguous review band are tuned on
+   out-of-time rows and persisted to `models/fusion_thresholds.json`.
 
 The transformed output is written to:
 
