@@ -21,10 +21,10 @@
 | Metric | Value |
 |---|---|
 | 📊 **Total Records Processed** | 7,218,220 transactions |
-| 🎯 **Random Forest ROC-AUC** | **0.978** |
-| 🎯 **XGBoost ROC-AUC** | 0.956 |
-| 🔍 **Fraud Recall (RF)** | 93.1% |
-| 🔍 **Fraud Recall (XGB)** | 90.0% |
+| 🎯 **XGBoost ROC-AUC (best, out-of-time)** | **0.941** |
+| 🎯 **Random Forest ROC-AUC (out-of-time)** | 0.932 |
+| 🎯 **FRAUD_LIKELY precision (tuned)** | 40.0% at ~30 alerts / 10k rows |
+| 🔍 **Review band coverage (tuned)** | 10% of traffic · catches 57% of remaining fraud |
 | 📁 **Datasets Used** | 4 public datasets (Kaggle + Zenodo) |
 | 🧠 **Models Trained** | XGBoost, Random Forest, Isolation Forest, LOF |
 | 🖥️ **Frontend** | React + Vite dashboard with 5 pages |
@@ -107,14 +107,26 @@ upi-fraud-detection/
 
 ## 📊 Model Performance
 
-### Supervised Models
+### Supervised Models (out-of-time evaluation)
 
-| Model | Accuracy | Precision | Recall | F1-Score | ROC-AUC |
-|---|---|---|---|---|---|
-| **Random Forest** | 93.7% | 83.7% | **93.1%** | 88.1% | **0.978** |
-| **XGBoost** | 90.1% | 75.4% | 90.0% | 82.0% | 0.956 |
+All scores are computed on the out-of-time evaluation period (the most recent 20% of each source's transactions) — never on training rows:
 
-> Trained on a fraud-preserving sample with 3:1 legitimate-to-fraud ratio + `class_weight="balanced"`. Population fraud rate calibration applied post-training.
+| Model | ROC-AUC | PR-AUC | Brier (raw → calibrated) | ECE (raw → calibrated) |
+|---|---|---|---|---|
+| **XGBoost (active model)** | **0.941** | 0.269 | 0.0452 → **0.0050** | 0.0915 → **0.0014** |
+| Random Forest | 0.932 | 0.221 | 0.0480 → **0.0051** | 0.0935 → **0.0016** |
+
+> Trained on a fraud-preserving sample with a 3:1 legitimate-to-fraud ratio only — no `class_weight`/`scale_pos_weight` re-weighting on top of it. Raw model scores are mapped to real-world fraud probabilities by isotonic calibration on a held-out, natural-prevalence calibration frame disjoint from the training sample.
+
+### Tuned Operating Points
+
+A naive 0.5 probability threshold is meaningless at ~0.4–0.6% fraud prevalence. These are the empirically tuned operating points persisted in `models/fusion_thresholds.json` and served by the API:
+
+| Band | Condition | Precision | Recall / Coverage |
+|---|---|---|---|
+| Supervised alert | calibrated p ≥ 0.098 | 25.0% | 35.1% of fraud (~83 alerts / 10k rows) |
+| **FRAUD_LIKELY** | fusion score ≥ 0.482 and supervised gate ≥ 0.098 | **40.0%** | 20.0% of fraud (~30 alerts / 10k rows) |
+| AMBIGUOUS_REVIEW | fusion score ≥ 0.395 or ambiguity rule fires | 2.7% | 10% of traffic; catches 57.3% of fraud not already in FRAUD_LIKELY |
 
 ### Unsupervised Models
 - **Isolation Forest** — 250 estimators, `contamination=0.05`
@@ -180,7 +192,7 @@ data/raw/digital_payment_transactions.csv
 python main.py --all --chunk-size 100000 --fit-rows 100000 --supervised-rows 500000 --legitimate-ratio 3 --anomaly-rows 200000
 ```
 
-This runs all 5 stages: data mapping → preprocessing → feature engineering → supervised training → anomaly training.
+This runs all 6 stages: data mapping → preprocessing → feature engineering → supervised training (+ isotonic calibration) → anomaly training → fusion threshold tuning.
 
 ### 4. Start the API + Dashboard
 
@@ -218,7 +230,7 @@ Open **http://localhost:5173** in your browser.
 2. **Chunked Parquet pipeline** — 7.2M rows processed without loading everything into RAM (100K rows/chunk)
 3. **Fraud-preserving stratified sampling** — Retains all fraud rows; legitimate rows sampled at configurable ratio across hour/day strata
 4. **Transparent fusion layer** — Not a third classifier. Combines `fraud_probability` (60%) + `anomaly_percentile` (40%) with a disagreement penalty that creates the `AMBIGUOUS_REVIEW` band
-5. **Probability calibration** — Corrects class-weight training bias back to the real population fraud rate using prior correction
+5. **Probability calibration** — Isotonic calibration (`CalibratedClassifierCV`, prefit) maps raw model scores to real-world fraud probabilities using a held-out, natural-prevalence calibration set
 6. **Sensitivity diagnostics** — Each prediction includes 6 controlled input variations (amount×10, night time, CASH_OUT, etc.) to explain model behavior
 
 ---
@@ -252,6 +264,8 @@ First-ever transactions are scored with neutralized behavioral features (frequen
 - **New users are reviewed *less*, not more.** Only **0.085%** of legitimate first-ever transactions land in `AMBIGUOUS_REVIEW` (~1 in 1,200); the two structural cold-start flags (`new_payee_flag`, `unusual_location_flag`) account for ~800 of those rows while also lifting fraud-in-review from 458 to 776 (+318 catches at ~29% incremental precision). The velocity-abuse override never fires on organic cold traffic by construction (it requires history-based signals such as rapid succession).
 - **Review-band load concentrates on returning users**, whose richer behavioral features produce higher signal disagreement — the opposite of the "new users get flagged for being new" pattern seen in production fraud systems.
 - **57% of first-transaction fraud resolves `LIKELY_LEGITIMATE`.** History-free scoring is inherently blind to account-takeover bursts on their opening transaction; real platforms compensate with deliberate extra scrutiny on first payments (step-up authentication, lower initial limits). Adding an equivalent first-transaction policy is the most impactful future improvement.
+
+> **Deterministic overrides are not quantified offline.** The two rule-based overrides that bypass the statistical fusion score — the Layer-2 absolute amount bound (> ₹20 lakh → `FRAUD_LIKELY`) and the Layer-3 velocity-abuse rule (3+ behavioral flags → `AMBIGUOUS_REVIEW`) — are **not measured for precision/recall on the offline evaluation set**. Both depend on live per-sender history (or physical-amount validation) that point-in-time batch evaluation cannot simulate; their value currently rests on logical design and manual testing, not quantified offline evaluation.
 
 ---
 
