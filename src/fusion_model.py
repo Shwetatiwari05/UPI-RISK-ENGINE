@@ -19,6 +19,17 @@ FUSION_WEIGHTS = {
     "unsupervised_unusualness_percentile": 0.40,
 }
 
+# Deterministic velocity-abuse override: when this many behavioral flags fire
+# simultaneously, the transaction is escalated to research review regardless of
+# the statistical fusion score (mirrors the absolute amount bound).
+VELOCITY_ABUSE_MIN_FLAGS = 3
+VELOCITY_ABUSE_FLAG_NAMES = (
+    "amount_spike",
+    "new_payee_flag",
+    "unusual_location_flag",
+    "rapid_transactions",
+)
+
 
 # Defaults describe the untuned behaviour. After a training run, main.py sweeps
 # these operating points on out-of-time data and persists overrides to
@@ -177,6 +188,16 @@ def fuse_signals(
     exceeds_realistic_bound = bool(
         supervised.get("exceeds_realistic_amount_bound", False)
     )
+    personalization = supervised.get("personalization") or {}
+    velocity_flags_true = [
+        name
+        for name in VELOCITY_ABUSE_FLAG_NAMES
+        if bool(personalization.get(name, False))
+    ]
+    velocity_rule_triggered = (
+        len(velocity_flags_true) >= VELOCITY_ABUSE_MIN_FLAGS
+        and not exceeds_realistic_bound
+    )
 
     if exceeds_realistic_bound:
         resolution = "FRAUD_LIKELY"
@@ -184,6 +205,15 @@ def fuse_signals(
             "Amount exceeds the realistic UPI ceiling of "
             f"{UPI_ABSOLUTE_MAX_AMOUNT:,.0f}; deterministic data-validation "
             "bound breached"
+        )
+    elif velocity_rule_triggered:
+        resolution = "AMBIGUOUS_REVIEW"
+        resolution_text = (
+            f"Rule-based override: {len(velocity_flags_true)} of "
+            f"{len(VELOCITY_ABUSE_FLAG_NAMES)} behavioral flags active "
+            f"({', '.join(velocity_flags_true)}) match the classic "
+            "account-takeover / velocity-abuse pattern; escalated to research "
+            "review independently of the statistical score"
         )
     elif ambiguity_score >= resolved_thresholds["ambiguous_score_threshold"] or (
         disagreement >= resolved_thresholds["ambiguous_disagreement_threshold"]
@@ -211,6 +241,11 @@ def fuse_signals(
         "resolution": resolution,
         "resolution_text": resolution_text,
         "exceeds_realistic_amount_bound": exceeds_realistic_bound,
+        "velocity_rule": {
+            "triggered": velocity_rule_triggered,
+            "flags_true": velocity_flags_true,
+            "min_flags": VELOCITY_ABUSE_MIN_FLAGS,
+        },
         "signal_disagreement": round(float(disagreement), 6),
         "supervised_uncertainty": round(float(supervised_uncertainty), 6),
         "repeatability_penalty": round(float(repeatability_penalty), 6),
