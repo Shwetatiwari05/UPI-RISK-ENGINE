@@ -10,7 +10,7 @@
 [![React](https://img.shields.io/badge/React-Vite-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://vitejs.dev)
 [![License](https://img.shields.io/badge/License-Academic%20Research-blueviolet?style=for-the-badge)](LICENSE)
 
-> **B.Tech Final Year Major Project** — An end-to-end offline machine learning research system that combines supervised fraud detection and unsupervised anomaly detection with a transparent explainable fusion layer, applied to 7.2 million real UPI transaction records.
+> **B.Tech Final Year Major Project** — An end-to-end post-facto machine learning research system that combines supervised fraud detection and unsupervised anomaly detection with a transparent explainable fusion layer, applied to 7.2 million real UPI transaction records.
 
 </div>
 
@@ -250,7 +250,7 @@ Open **http://localhost:5173** in your browser.
 
 ## ⚠️ Research Scope & Disclaimer
 
-This system is an **offline, post-transaction research experiment**. It intentionally does **not** implement:
+This system is a **post-facto research experiment**. It intentionally does **not** implement:
 - Real-time payment processing or streaming
 - Banking system integration or authentication
 - Production deployment or fraud blocking
@@ -265,7 +265,7 @@ First-ever transactions are scored with neutralized behavioral features (frequen
 - **Review-band load concentrates on returning users**, whose richer behavioral features produce higher signal disagreement — the opposite of the "new users get flagged for being new" pattern seen in production fraud systems.
 - **57% of first-transaction fraud resolves `LIKELY_LEGITIMATE`.** History-free scoring is inherently blind to account-takeover bursts on their opening transaction; real platforms compensate with deliberate extra scrutiny on first payments (step-up authentication, lower initial limits). Adding an equivalent first-transaction policy is the most impactful future improvement.
 
-> **Deterministic overrides are not quantified offline.** The two rule-based overrides that bypass the statistical fusion score — the Layer-2 absolute amount bound (> ₹20 lakh → `FRAUD_LIKELY`) and the Layer-3 velocity-abuse rule (3+ behavioral flags → `AMBIGUOUS_REVIEW`) — are **not measured for precision/recall on the offline evaluation set**. Both depend on live per-sender history (or physical-amount validation) that point-in-time batch evaluation cannot simulate; their value currently rests on logical design and manual testing, not quantified offline evaluation.
+> **Deterministic overrides are not quantified offline.** The two rule-based overrides that bypass the statistical fusion score — the Layer-2 absolute amount bound (> ₹20 lakh → `FRAUD_LIKELY`) and the Layer-3 velocity-abuse rule (3+ behavioral flags → `AMBIGUOUS_REVIEW`) — are **not measured for precision/recall on the offline evaluation set**. Both depend on live per-sender history (or physical-amount validation) that point-in-time batch evaluation cannot simulate; their value currently rests on logical design and manual testing, not on quantified offline evaluation.
 
 ---
 
