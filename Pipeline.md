@@ -77,8 +77,11 @@ python main.py --all --supervised-rows 700000 --legitimate-ratio 3 --anomaly-row
 
 Supervised sampling preserves every fraud row when the row budget allows it, then
 selects legitimate rows at the configured ratio. Legitimate rows are sampled
-proportionally across available hour/day strata. Random Forest keeps
-`class_weight="balanced"` and XGBoost keeps its calculated `scale_pos_weight`.
+proportionally across available hour/day strata. This fraud-preserving
+undersampling is the only class-imbalance correction applied — neither model
+uses `class_weight` or `scale_pos_weight` re-weighting on top of it. Raw model
+scores are mapped to real-world fraud probabilities by isotonic calibration on
+a held-out, natural-prevalence calibration frame disjoint from training.
 The default legitimate ratio is 3:1 and can be changed with
 `--legitimate-ratio 5`.
 
