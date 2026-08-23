@@ -245,6 +245,14 @@ This system is an **offline, post-transaction research experiment**. It intentio
 
 The fusion resolution (`LIKELY_LEGITIMATE` / `AMBIGUOUS_REVIEW` / `FRAUD_LIKELY`) is a research score for comparing model signals — **not a payment decision**.
 
+### Known Limitation: Cold-Start Blind Spot (measured on out-of-time data)
+
+First-ever transactions are scored with neutralized behavioral features (frequency 0, population-average baseline, no velocity history), which has two measured consequences on the out-of-time test set (1.42M rows; first-ever senders are **87.9% of traffic**):
+
+- **New users are reviewed *less*, not more.** Only **0.085%** of legitimate first-ever transactions land in `AMBIGUOUS_REVIEW` (~1 in 1,200); the two structural cold-start flags (`new_payee_flag`, `unusual_location_flag`) account for ~800 of those rows while also lifting fraud-in-review from 458 to 776 (+318 catches at ~29% incremental precision). The velocity-abuse override never fires on organic cold traffic by construction (it requires history-based signals such as rapid succession).
+- **Review-band load concentrates on returning users**, whose richer behavioral features produce higher signal disagreement — the opposite of the "new users get flagged for being new" pattern seen in production fraud systems.
+- **57% of first-transaction fraud resolves `LIKELY_LEGITIMATE`.** History-free scoring is inherently blind to account-takeover bursts on their opening transaction; real platforms compensate with deliberate extra scrutiny on first payments (step-up authentication, lower initial limits). Adding an equivalent first-transaction policy is the most impactful future improvement.
+
 ---
 
 ## 👥 Contributors
