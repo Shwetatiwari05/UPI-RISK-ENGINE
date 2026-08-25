@@ -551,10 +551,11 @@ def _select_review_threshold(
     if index is None:
         raise ValueError("No review-band candidate available.")
 
-    if index + 1 < len(s_sorted):
-        boundary = float((s_sorted[index] + s_sorted[index + 1]) / 2.0)
+    block_index = int(positions[index])
+    if block_index + 1 < len(s_sorted):
+        boundary = float((s_sorted[block_index] + s_sorted[block_index + 1]) / 2.0)
     else:
-        boundary = float(s_sorted[index]) / 2.0
+        boundary = float(s_sorted[block_index]) / 2.0
 
     remaining_frauds = max(int(labels.sum() - labels[fraud_band].sum()), 1)
     return {
