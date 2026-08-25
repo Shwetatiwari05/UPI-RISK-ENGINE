@@ -1,8 +1,8 @@
 {
   "thresholds": {
-    "fraud_likely_fusion_threshold": 0.481686,
+    "fraud_likely_fusion_threshold": 0.48167667290544514,
     "fraud_likely_requires_supervised_probability": 0.09801234,
-    "ambiguous_review_fusion_threshold": 0.370239,
+    "ambiguous_review_fusion_threshold": 0.37023898546645045,
     "ambiguous_score_threshold": 0.38,
     "ambiguous_disagreement_threshold": 0.45
   },
@@ -41,6 +41,6 @@
     "artifact": "xgboost_model.pkl",
     "reference_rows": 1284999
   },
-  "tuned_at_utc": "2026-08-25T07:38:20.477472+00:00",
+  "tuned_at_utc": "2026-08-25T08:10:21.459993+00:00",
   "supervised_artifact": "xgboost_model.pkl"
 }

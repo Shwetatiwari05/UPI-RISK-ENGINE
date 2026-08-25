@@ -333,33 +333,46 @@ def tune_fusion_thresholds(
         order = np.argsort(-scores, kind="mergesort")
         sorted_labels = labels[order]
         true_positive = np.cumsum(sorted_labels)
-        false_positive = np.cumsum(1 - sorted_labels)
-        precision = true_positive / np.maximum(true_positive + false_positive, 1)
-        recall = true_positive / total_positives
-        f1 = np.where(
-            precision + recall > 0,
-            2 * precision * recall / np.maximum(precision + recall, 1e-12),
-            0.0,
-        )
         sorted_scores = scores[order]
 
-        def _entry(index: int, met: bool) -> dict[str, Any]:
-            upper = sorted_scores[index - 1] if index > 0 else sorted_scores[index] + 1.0
-            boundary = float((upper + sorted_scores[index]) / 2.0)
+        block_ends = np.flatnonzero(sorted_scores[:-1] != sorted_scores[1:])
+        positions = np.concatenate([block_ends, [len(sorted_scores) - 1]])
+        tp_blocks = true_positive[positions]
+        block_size = positions + 1
+        precision_b = tp_blocks / block_size
+        recall_b = true_positive[positions] / total_positives
+        denom_b = np.maximum(precision_b + recall_b, 1e-12)
+        f1_b = np.where(
+            precision_b + recall_b > 0,
+            2 * precision_b * recall_b / denom_b,
+            0.0,
+        )
+
+        def _entry(k: int, met: bool) -> dict[str, Any]:
+            block_index = int(positions[k])
+            if block_index + 1 < len(sorted_scores):
+                boundary = float(
+                    (sorted_scores[block_index] + sorted_scores[block_index + 1])
+                    / 2.0
+                )
+            else:
+                boundary = float(sorted_scores[block_index]) / 2.0
             return {
                 "gate": round(float(gate), 8),
-                "fusion_threshold": round(float(np.clip(boundary, 0.0, 1.0)), 6),
-                "precision": round(float(precision[index]), 6),
-                "recall": round(float(recall[index]), 6),
-                "f1": round(float(f1[index]), 6),
-                "alerts_per_10k_rows": round((index + 1) / len(y) * 10_000, 2),
+                "fusion_threshold": float(np.clip(boundary, 0.0, 1.0)),
+                "precision": round(float(precision_b[k]), 6),
+                "recall": round(float(recall_b[k]), 6),
+                "f1": round(float(f1_b[k]), 6),
+                "alerts_per_10k_rows": round(
+                    int(block_size[k]) / len(y) * 10_000, 2
+                ),
                 "target_precision_met": met,
             }
 
-        feasible = np.flatnonzero(precision >= min_fraud_precision)
+        feasible = np.flatnonzero(precision_b >= min_fraud_precision)
         if feasible.size:
             return _entry(int(feasible[-1]), True)
-        return _entry(int(np.argmax(f1)), False)
+        return _entry(int(np.argmax(f1_b)), False)
 
     # Pass one: pick the gate. Ambiguity uses a provisional kernel centre so a
     # gate exists at all; with legacy inputs (no ranks) the formulas do not
@@ -559,7 +572,7 @@ def _select_review_threshold(
 
     remaining_frauds = max(int(labels.sum() - labels[fraud_band].sum()), 1)
     return {
-        "threshold": round(float(np.clip(boundary, 0.0, 1.0)), 6),
+        "threshold": float(np.clip(boundary, 0.0, 1.0)),
         "precision_met": precision_met,
         "share_in_window": share_in_window,
         "achieved": {
