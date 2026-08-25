@@ -26,7 +26,7 @@ from src.probability_calibration import (
 )
 from src.schema_mapping import COMMON_SCHEMA
 from src.supervised_model import predict_fraud_probability
-from src.utils import MODELS_DIR, load_joblib, safe_datetime
+from src.utils import MODELS_DIR, load_joblib
 
 
 class PredictionEngine:
@@ -281,7 +281,16 @@ def transaction_to_common_schema(transaction: dict[str, Any]) -> pd.DataFrame:
         "fraud_label": int(transaction.get("fraud_label", 0)),
     }
     frame = pd.DataFrame([row], columns=COMMON_SCHEMA)
-    frame["timestamp"] = safe_datetime(frame["timestamp"])
-    frame["timestamp"] = frame["timestamp"].fillna(pd.Timestamp.now())
+    stamp = pd.Timestamp(row["timestamp"])
+    if stamp is pd.NaT or pd.isna(stamp):
+        stamp = pd.Timestamp.now()
+    # Dashboard-entered times are IST wall-clock values; normalize any
+    # timezone-aware input into the same IST-naive convention so temporal
+    # features and the live-history velocity window stay apples-to-apples.
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("Asia/Kolkata")
+    else:
+        stamp = stamp.tz_localize("Asia/Kolkata")
+    frame["timestamp"] = stamp.tz_localize(None)
     frame["amount"] = frame["amount"].replace([np.inf, -np.inf], 0).fillna(0)
     return frame

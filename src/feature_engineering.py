@@ -302,9 +302,9 @@ def _apply_feature_context(
             if pd.notna(previous_timestamp):
                 current_timestamp = pd.Timestamp(row.timestamp)
                 if previous_timestamp.tzinfo is not None:
-                    previous_timestamp = previous_timestamp.tz_convert("UTC").tz_localize(None)
+                    previous_timestamp = previous_timestamp.tz_convert("Asia/Kolkata").tz_localize(None)
                 if current_timestamp.tzinfo is not None:
-                    current_timestamp = current_timestamp.tz_convert("UTC").tz_localize(None)
+                    current_timestamp = current_timestamp.tz_convert("Asia/Kolkata").tz_localize(None)
                 delta_minutes = (current_timestamp - previous_timestamp).total_seconds() / 60.0
                 minutes_since_prev = max(delta_minutes, 0.0)
 

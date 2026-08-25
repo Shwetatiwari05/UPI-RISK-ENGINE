@@ -30,12 +30,17 @@ import "./styles.css";
 
 const API_BASE = "/api";
 
+function toLocalInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 const defaultForm = {
   amount: 650,
   transaction_type: "TRANSFER",
   device_type: "Android",
   merchant_category: "Personal",
-  timestamp: new Date().toISOString().slice(0, 16),
+  timestamp: toLocalInputValue(new Date()),
   sender_id: "user_1024",
   receiver_id: "user_2048",
   location: "Mumbai",
@@ -90,7 +95,7 @@ function App() {
       transaction_type: preset.transaction_type,
       device_type: preset.device_type,
       merchant_category: preset.merchant_category,
-      timestamp: timestamp.toISOString().slice(0, 16),
+      timestamp: toLocalInputValue(timestamp),
       sender_id: preset.sender_id,
       receiver_id: preset.receiver_id,
       location: preset.location,
@@ -110,7 +115,6 @@ function App() {
         body: JSON.stringify({
           ...form,
           amount: Number(form.amount),
-          timestamp: new Date(form.timestamp).toISOString(),
         }),
       });
       const data = await response.json();
