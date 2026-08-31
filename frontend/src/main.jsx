@@ -28,7 +28,8 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API_BASE = "/api";
+const VITE_API_URL = __VITE_API_URL__ || "";
+const API_BASE = VITE_API_URL ? `${VITE_API_URL}/api` : "/api";
 
 function toLocalInputValue(date) {
   const pad = (n) => String(n).padStart(2, "0");

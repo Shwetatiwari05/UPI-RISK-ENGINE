@@ -18,6 +18,7 @@ ENV/
 # Environment files
 .env
 .env.*
+!.env.example
 
 # Local model and generated artifacts
 models/*.pkl
