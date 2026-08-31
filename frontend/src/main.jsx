@@ -29,7 +29,7 @@ import {
 import "./styles.css";
 
 const VITE_API_URL = __VITE_API_URL__ || "";
-const API_BASE = VITE_API_URL ? `${VITE_API_URL}/api` : "/api";
+const API_BASE = VITE_API_URL ? VITE_API_URL : "/api";
 
 function toLocalInputValue(date) {
   const pad = (n) => String(n).padStart(2, "0");
